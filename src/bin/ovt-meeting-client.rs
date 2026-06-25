@@ -9,9 +9,10 @@ use cpal::{
     SampleFormat, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
+use futures_util::{SinkExt, StreamExt};
 use hound::{SampleFormat as WavSampleFormat, WavSpec, WavWriter};
-use reqwest::multipart;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::{
     env,
     net::SocketAddr,
@@ -23,6 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::process::Command;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Clone)]
@@ -30,7 +32,6 @@ struct App {
     config: ClientConfig,
     controls: Arc<Controls>,
     state: Arc<Mutex<ClientState>>,
-    http: reqwest::Client,
 }
 
 #[derive(Clone, Debug)]
@@ -38,10 +39,15 @@ struct ClientConfig {
     server_url: String,
     bind: SocketAddr,
     direction: String,
-    chunk_ms: u64,
     data_dir: PathBuf,
     play_cmd: String,
     play_target: Option<String>,
+    auth_token: Option<String>,
+    vad_threshold: f32,
+    silence_ms: u64,
+    min_voice_ms: u64,
+    max_utterance_ms: u64,
+    pre_roll_ms: u64,
 }
 
 impl ClientConfig {
@@ -54,25 +60,54 @@ impl ClientConfig {
             .unwrap_or_else(|_| "127.0.0.1:8790".into())
             .parse()?;
         let direction = env::var("OVT_CLIENT_DIRECTION").unwrap_or_else(|_| "es_to_en".into());
-        let chunk_ms = env::var("OVT_CLIENT_CHUNK_MS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(2500);
         let data_dir =
             PathBuf::from(env::var("OVT_CLIENT_DATA_DIR").unwrap_or_else(|_| "data/client".into()));
         let play_cmd = env::var("OVT_CLIENT_PLAY_CMD").unwrap_or_else(|_| "pw-play".into());
         let play_target = env::var("OVT_CLIENT_PLAY_TARGET")
             .ok()
             .or_else(|| Some("ovt-teams-mic-sink".into()));
+        let auth_token = env::var("OVT_CLIENT_AUTH_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                env::var("OVT_AUTH_TOKEN")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            });
+        let vad_threshold = env::var("OVT_CLIENT_VAD_THRESHOLD")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0.012);
+        let silence_ms = env::var("OVT_CLIENT_SILENCE_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(800);
+        let min_voice_ms = env::var("OVT_CLIENT_MIN_VOICE_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(280);
+        let max_utterance_ms = env::var("OVT_CLIENT_MAX_UTTERANCE_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8500);
+        let pre_roll_ms = env::var("OVT_CLIENT_PRE_ROLL_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(240);
 
         Ok(Self {
             server_url,
             bind,
             direction,
-            chunk_ms,
             data_dir,
             play_cmd,
             play_target,
+            auth_token,
+            vad_threshold,
+            silence_ms,
+            min_voice_ms,
+            max_utterance_ms,
+            pre_roll_ms,
         })
     }
 }
@@ -96,17 +131,55 @@ struct ClientState {
     output_muted: bool,
     chunks_sent: u64,
     last_latency_ms: u128,
+    current_rms: f32,
     last_transcript: String,
     last_translation: String,
     last_audio_url: Option<String>,
     last_error: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct InterpretResponse {
-    transcript: String,
-    translation: String,
-    audio_url: Option<String>,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Direction {
+    EsToEn,
+    EnToEs,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StreamStart {
+    direction: Direction,
+    synthesize: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+#[allow(dead_code)]
+enum StreamEvent {
+    Ready,
+    Listening,
+    Processing {
+        id: String,
+    },
+    TranscriptFinal {
+        id: String,
+        text: String,
+    },
+    TranslationFinal {
+        id: String,
+        text: String,
+    },
+    AudioStart {
+        id: String,
+        content_type: String,
+        bytes: usize,
+    },
+    Done {
+        id: String,
+        latency_ms: u128,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[tokio::main]
@@ -131,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
         output_muted: false,
         chunks_sent: 0,
         last_latency_ms: 0,
+        current_rms: 0.0,
         last_transcript: String::new(),
         last_translation: String::new(),
         last_audio_url: None,
@@ -140,7 +214,6 @@ async fn main() -> anyhow::Result<()> {
         config,
         controls,
         state,
-        http: reqwest::Client::new(),
     };
 
     let audio_app = app.clone();
@@ -175,7 +248,6 @@ fn run_audio_capture(app: App) -> anyhow::Result<()> {
     let sample_rate = supported_config.sample_rate().0;
     let channels = supported_config.channels() as usize;
     let stream_config: StreamConfig = supported_config.clone().into();
-    let chunk_samples = ((sample_rate as u64 * app.config.chunk_ms) / 1000).max(1) as usize;
     let (tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
 
     let stream = match supported_config.sample_format() {
@@ -188,7 +260,15 @@ fn run_audio_capture(app: App) -> anyhow::Result<()> {
 
     update_status(&app, "listening");
     let rt = tokio::runtime::Runtime::new()?;
-    let mut buffer = Vec::with_capacity(chunk_samples * 2);
+    let silence_samples = samples_for_ms(sample_rate, app.config.silence_ms);
+    let min_voice_samples = samples_for_ms(sample_rate, app.config.min_voice_ms);
+    let max_utterance_samples = samples_for_ms(sample_rate, app.config.max_utterance_ms);
+    let pre_roll_samples = samples_for_ms(sample_rate, app.config.pre_roll_ms);
+    let mut pre_roll = VecDeque::<f32>::with_capacity(pre_roll_samples);
+    let mut utterance = Vec::<f32>::with_capacity(max_utterance_samples);
+    let mut in_speech = false;
+    let mut silence = 0usize;
+    let mut voiced = 0usize;
 
     while !app.controls.stop.load(Ordering::Relaxed) {
         let frame = match rx.recv_timeout(Duration::from_millis(100)) {
@@ -201,18 +281,53 @@ fn run_audio_capture(app: App) -> anyhow::Result<()> {
         if app.controls.paused.load(Ordering::Relaxed)
             || app.controls.input_muted.load(Ordering::Relaxed)
         {
-            buffer.clear();
+            pre_roll.clear();
+            utterance.clear();
+            in_speech = false;
+            silence = 0;
+            voiced = 0;
             continue;
         }
 
-        buffer.extend(frame);
-        if buffer.len() < chunk_samples {
+        let frame_rms = rms(&frame);
+        set_rms(&app, frame_rms);
+        if !in_speech {
+            push_pre_roll(&mut pre_roll, &frame, pre_roll_samples);
+            if frame_rms >= app.config.vad_threshold {
+                in_speech = true;
+                silence = 0;
+                voiced = frame.len();
+                utterance.extend(pre_roll.iter().copied());
+                utterance.extend(frame);
+                update_status(&app, "speaking");
+            }
             continue;
         }
 
-        let chunk = std::mem::take(&mut buffer);
-        if let Err(error) = rt.block_on(process_chunk(app.clone(), chunk, sample_rate)) {
-            set_error(&app, error);
+        utterance.extend(&frame);
+        if frame_rms >= app.config.vad_threshold {
+            voiced += frame.len();
+            silence = 0;
+        } else {
+            silence += frame.len();
+        }
+
+        let should_flush = (silence >= silence_samples && voiced >= min_voice_samples)
+            || utterance.len() >= max_utterance_samples;
+        if should_flush {
+            let speech = trim_tail_silence(std::mem::take(&mut utterance), silence);
+            pre_roll.clear();
+            in_speech = false;
+            silence = 0;
+            voiced = 0;
+
+            if speech.len() >= min_voice_samples {
+                if let Err(error) = rt.block_on(process_utterance(app.clone(), speech, sample_rate))
+                {
+                    set_error(&app, error);
+                }
+            }
+            update_status(&app, "listening");
         }
     }
 
@@ -287,48 +402,65 @@ fn log_stream_error(error: cpal::StreamError) {
     tracing::error!("audio stream error: {error}");
 }
 
-async fn process_chunk(app: App, samples: Vec<f32>, sample_rate: u32) -> anyhow::Result<()> {
-    set_status(&app, "uploading").await;
+async fn process_utterance(app: App, samples: Vec<f32>, sample_rate: u32) -> anyhow::Result<()> {
+    set_status(&app, "streaming").await;
     let started = Instant::now();
     let direction = current_direction(&app);
     let wav_path = app.config.data_dir.join("chunk.wav");
     write_wav(&wav_path, &samples, sample_rate)?;
 
     let bytes = tokio::fs::read(&wav_path).await?;
-    let part = multipart::Part::bytes(bytes)
-        .file_name("meeting-chunk.wav")
-        .mime_str("audio/wav")?;
-    let form = multipart::Form::new()
-        .text("direction", direction.clone())
-        .text("synthesize", "true")
-        .part("audio", part);
-
-    let response = app
-        .http
-        .post(format!("{}/v1/interpret/file", app.config.server_url))
-        .multipart(form)
-        .send()
+    let url = websocket_url(&app.config.server_url, app.config.auth_token.as_deref());
+    let (mut socket, _) = connect_async(&url)
         .await
-        .context("failed to call OVT server")?
-        .error_for_status()
-        .context("OVT server returned an error")?
-        .json::<InterpretResponse>()
-        .await
-        .context("invalid OVT server response")?;
+        .with_context(|| format!("failed to connect websocket {url}"))?;
+    let start = StreamStart {
+        direction: parse_direction(&direction),
+        synthesize: true,
+    };
+    socket
+        .send(Message::Text(serde_json::to_string(&start)?.into()))
+        .await?;
+    socket.send(Message::Binary(bytes.into())).await?;
 
-    if let Some(audio_url) = response.audio_url.as_deref() {
-        if !app.controls.output_muted.load(Ordering::Relaxed) {
-            let audio = app
-                .http
-                .get(format!("{}{}", app.config.server_url, audio_url))
-                .send()
-                .await?
-                .error_for_status()?
-                .bytes()
-                .await?;
-            let out_path = app.config.data_dir.join("translated.wav");
-            tokio::fs::write(&out_path, audio).await?;
-            play_audio(&app, &out_path).await?;
+    let mut transcript = String::new();
+    let mut translation = String::new();
+    let mut audio_url = None;
+    let out_path = app.config.data_dir.join("translated.wav");
+
+    while let Some(message) = socket.next().await {
+        match message? {
+            Message::Text(text) => {
+                let event: StreamEvent = serde_json::from_str(&text)?;
+                match event {
+                    StreamEvent::Ready | StreamEvent::Listening => {}
+                    StreamEvent::Processing { .. } => {
+                        set_status(&app, "processing").await;
+                    }
+                    StreamEvent::TranscriptFinal { text, .. } => {
+                        transcript = text;
+                        update_last_text(&app, &transcript, &translation, audio_url.clone());
+                    }
+                    StreamEvent::TranslationFinal { text, .. } => {
+                        translation = text;
+                        update_last_text(&app, &transcript, &translation, audio_url.clone());
+                    }
+                    StreamEvent::AudioStart { .. } => {
+                        set_status(&app, "receiving_audio").await;
+                    }
+                    StreamEvent::Done { .. } => break,
+                    StreamEvent::Error { message } => bail!(message),
+                }
+            }
+            Message::Binary(audio) => {
+                audio_url = Some("websocket://last-audio".to_string());
+                tokio::fs::write(&out_path, audio).await?;
+                if !app.controls.output_muted.load(Ordering::Relaxed) {
+                    play_audio(&app, &out_path).await?;
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
         }
     }
 
@@ -338,11 +470,60 @@ async fn process_chunk(app: App, samples: Vec<f32>, sample_rate: u32) -> anyhow:
     state.direction = direction;
     state.chunks_sent += 1;
     state.last_latency_ms = elapsed;
-    state.last_transcript = response.transcript;
-    state.last_translation = response.translation;
-    state.last_audio_url = response.audio_url;
+    state.last_transcript = transcript;
+    state.last_translation = translation;
+    state.last_audio_url = audio_url;
     state.last_error = None;
     Ok(())
+}
+
+fn websocket_url(server_url: &str, auth_token: Option<&str>) -> String {
+    let base = server_url.trim_end_matches('/');
+    let mut url = if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}/v1/stream/meeting")
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}/v1/stream/meeting")
+    } else {
+        format!("ws://{base}/v1/stream/meeting")
+    };
+    if let Some(token) = auth_token {
+        url.push_str("?token=");
+        url.push_str(token);
+    }
+    url
+}
+
+fn parse_direction(value: &str) -> Direction {
+    match value {
+        "en_to_es" => Direction::EnToEs,
+        _ => Direction::EsToEn,
+    }
+}
+
+fn samples_for_ms(sample_rate: u32, millis: u64) -> usize {
+    ((sample_rate as u64 * millis) / 1000).max(1) as usize
+}
+
+fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+fn push_pre_roll(pre_roll: &mut VecDeque<f32>, frame: &[f32], limit: usize) {
+    for sample in frame {
+        pre_roll.push_back(*sample);
+        while pre_roll.len() > limit {
+            pre_roll.pop_front();
+        }
+    }
+}
+
+fn trim_tail_silence(mut samples: Vec<f32>, silence: usize) -> Vec<f32> {
+    let keep = samples.len().saturating_sub(silence / 2);
+    samples.truncate(keep);
+    samples
 }
 
 fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> anyhow::Result<()> {
@@ -439,6 +620,20 @@ fn refresh_control_state(app: &App) {
     state.input_muted = input_muted;
     state.output_muted = output_muted;
     state.direction = direction;
+}
+
+fn set_rms(app: &App, rms: f32) {
+    app.state
+        .lock()
+        .expect("client state mutex poisoned")
+        .current_rms = rms;
+}
+
+fn update_last_text(app: &App, transcript: &str, translation: &str, audio_url: Option<String>) {
+    let mut state = app.state.lock().expect("client state mutex poisoned");
+    state.last_transcript = transcript.into();
+    state.last_translation = translation.into();
+    state.last_audio_url = audio_url;
 }
 
 fn update_status(app: &App, status: &str) {

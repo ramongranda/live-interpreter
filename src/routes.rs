@@ -3,19 +3,31 @@ use crate::{
     config::Config,
     translate::Translator,
     tts::TtsEngine,
-    types::{Direction, HealthResponse, InterpretResponse, TextInterpretRequest},
+    types::{
+        Direction, HealthResponse, InterpretResponse, StreamEvent, StreamStart,
+        TextInterpretRequest,
+    },
 };
 use anyhow::Context;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Multipart, Path, State},
-    http::StatusCode,
+    extract::{
+        DefaultBodyLimit, Multipart, Path, Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use chrono::Utc;
-use std::{path::PathBuf, sync::Arc};
+use futures_util::{SinkExt, StreamExt};
+use std::{
+    collections::HashMap,
+    path::{Path as FsPath, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 use thiserror::Error;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use uuid::Uuid;
@@ -35,6 +47,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/audio/{filename}", get(download_audio))
         .route("/v1/interpret/text", post(interpret_text))
         .route("/v1/interpret/file", post(interpret_file))
+        .route("/v1/stream/meeting", get(meeting_stream))
         .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -59,8 +72,10 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 
 async fn interpret_text(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<TextInterpretRequest>,
 ) -> Result<Json<InterpretResponse>, AppError> {
+    require_auth(&state, &headers, None)?;
     let id = Uuid::new_v4();
     let translation = state
         .translator
@@ -90,8 +105,10 @@ async fn interpret_text(
 
 async fn interpret_file(
     State(state): State<AppState>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Json<InterpretResponse>, AppError> {
+    require_auth(&state, &headers, None)?;
     let id = Uuid::new_v4();
     let mut direction = Direction::EsToEn;
     let mut synthesize = false;
@@ -134,9 +151,204 @@ async fn interpret_file(
 
     let audio_path =
         audio_path.ok_or_else(|| AppError::BadRequest("missing audio field".into()))?;
+    let response =
+        process_audio_path(state.clone(), id, &audio_path, direction, synthesize).await?;
+    persist_response(&state.config.data_dir, &response).await?;
+    Ok(Json(response))
+}
+
+async fn meeting_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    upgrade: WebSocketUpgrade,
+) -> impl IntoResponse {
+    if let Err(error) = require_auth(&state, &headers, query.get("token").map(String::as_str)) {
+        return error.into_response();
+    }
+    upgrade.on_upgrade(move |socket| handle_meeting_stream(socket, state))
+}
+
+async fn handle_meeting_stream(socket: WebSocket, state: AppState) {
+    let (mut sender, mut receiver) = socket.split();
+
+    if send_event(&mut sender, &StreamEvent::Ready).await.is_err() {
+        return;
+    }
+
+    let mut start = StreamStart {
+        direction: Direction::EsToEn,
+        synthesize: true,
+    };
+
+    while let Some(message) = receiver.next().await {
+        let message = match message {
+            Ok(message) => message,
+            Err(error) => {
+                let _ = send_event(
+                    &mut sender,
+                    &StreamEvent::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+                break;
+            }
+        };
+
+        match message {
+            Message::Text(text) => match serde_json::from_str::<StreamStart>(&text) {
+                Ok(value) => {
+                    start = value;
+                    let _ = send_event(&mut sender, &StreamEvent::Listening).await;
+                }
+                Err(error) => {
+                    let _ = send_event(
+                        &mut sender,
+                        &StreamEvent::Error {
+                            message: format!("invalid stream start message: {error}"),
+                        },
+                    )
+                    .await;
+                }
+            },
+            Message::Binary(bytes) => {
+                let id = Uuid::new_v4();
+                let started = Instant::now();
+                if send_event(&mut sender, &StreamEvent::Processing { id })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+
+                match process_stream_audio(state.clone(), id, &bytes, &start).await {
+                    Ok(response) => {
+                        let latency_ms = started.elapsed().as_millis();
+                        if send_event(
+                            &mut sender,
+                            &StreamEvent::TranscriptFinal {
+                                id,
+                                text: response.transcript.clone(),
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
+                        if send_event(
+                            &mut sender,
+                            &StreamEvent::TranslationFinal {
+                                id,
+                                text: response.translation.clone(),
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
+                        if let Some(audio_path) = response.audio_path.as_ref() {
+                            match tokio::fs::read(audio_path).await {
+                                Ok(audio) => {
+                                    if send_event(
+                                        &mut sender,
+                                        &StreamEvent::AudioStart {
+                                            id,
+                                            content_type: "audio/wav".into(),
+                                            bytes: audio.len(),
+                                        },
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                    if sender.send(Message::Binary(audio.into())).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = send_event(
+                                        &mut sender,
+                                        &StreamEvent::Error {
+                                            message: error.to_string(),
+                                        },
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                        if send_event(&mut sender, &StreamEvent::Done { id, latency_ms })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = send_event(
+                            &mut sender,
+                            &StreamEvent::Error {
+                                message: error.to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+}
+
+async fn send_event(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    event: &StreamEvent,
+) -> Result<(), axum::Error> {
+    let body = serde_json::to_string(event).expect("stream event serialization failed");
+    sender.send(Message::Text(body.into())).await
+}
+
+async fn process_stream_audio(
+    state: AppState,
+    id: Uuid,
+    audio: &[u8],
+    start: &StreamStart,
+) -> anyhow::Result<InterpretResponse> {
+    let uploads = state.config.data_dir.join("uploads");
+    tokio::fs::create_dir_all(&uploads)
+        .await
+        .context("failed to create upload directory")?;
+    let audio_path = uploads.join(format!("{id}-stream.wav"));
+    tokio::fs::write(&audio_path, audio)
+        .await
+        .context("failed to write stream audio")?;
+
+    let response = process_audio_path(
+        state.clone(),
+        id,
+        &audio_path,
+        start.direction.clone(),
+        start.synthesize,
+    )
+    .await?;
+    persist_response(&state.config.data_dir, &response).await?;
+    Ok(response)
+}
+
+async fn process_audio_path(
+    state: AppState,
+    id: Uuid,
+    audio_path: &FsPath,
+    direction: Direction,
+    synthesize: bool,
+) -> anyhow::Result<InterpretResponse> {
     let segments = state
         .asr
-        .transcribe_file(&audio_path, direction.source_lang())
+        .transcribe_file(audio_path, direction.source_lang())
         .await?;
     let transcript = segments
         .iter()
@@ -150,7 +362,7 @@ async fn interpret_file(
         None
     };
 
-    let response = InterpretResponse {
+    Ok(InterpretResponse {
         id,
         created_at: Utc::now(),
         direction,
@@ -158,15 +370,16 @@ async fn interpret_file(
         translation,
         audio_url: generated_audio.as_ref().and_then(audio_url),
         audio_path: generated_audio,
-    };
-    persist_response(&state.config.data_dir, &response).await?;
-    Ok(Json(response))
+    })
 }
 
 async fn download_audio(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
     Path(filename): Path<String>,
 ) -> Result<Response, AppError> {
+    require_auth(&state, &headers, query.get("token").map(String::as_str))?;
     let filename = safe_filename(&filename);
     if !filename.ends_with(".wav") {
         return Err(AppError::BadRequest(
@@ -185,6 +398,27 @@ async fn download_audio(
         .body(Body::from(bytes))
         .context("failed to build audio response")
         .map_err(AppError::Internal)
+}
+
+fn require_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> Result<(), AppError> {
+    let Some(expected) = state.config.auth_token.as_deref() else {
+        return Ok(());
+    };
+
+    let header_token = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+
+    if header_token == Some(expected) || query_token == Some(expected) {
+        Ok(())
+    } else {
+        Err(AppError::Unauthorized)
+    }
 }
 
 async fn persist_response(data_dir: &PathBuf, response: &InterpretResponse) -> anyhow::Result<()> {
@@ -237,6 +471,8 @@ mod tests {
 
 #[derive(Debug, Error)]
 pub enum AppError {
+    #[error("unauthorized")]
+    Unauthorized,
     #[error("{0}")]
     BadRequest(String),
     #[error(transparent)]
@@ -246,6 +482,7 @@ pub enum AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = match self {
+            AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };

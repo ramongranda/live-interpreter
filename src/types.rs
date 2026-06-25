@@ -69,3 +69,44 @@ pub struct Segment {
     pub end_ms: i64,
     pub text: String,
 }
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StreamStart {
+    pub direction: Direction,
+    #[serde(default = "default_stream_synthesize")]
+    pub synthesize: bool,
+}
+
+fn default_stream_synthesize() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum StreamEvent {
+    Ready,
+    Listening,
+    Processing {
+        id: Uuid,
+    },
+    TranscriptFinal {
+        id: Uuid,
+        text: String,
+    },
+    TranslationFinal {
+        id: Uuid,
+        text: String,
+    },
+    AudioStart {
+        id: Uuid,
+        content_type: String,
+        bytes: usize,
+    },
+    Done {
+        id: Uuid,
+        latency_ms: u128,
+    },
+    Error {
+        message: String,
+    },
+}

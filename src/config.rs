@@ -14,6 +14,7 @@ pub struct Config {
     pub voice_ref: Option<PathBuf>,
     pub voice_ref_text: Option<String>,
     pub ffmpeg_bin: String,
+    pub auth_token: Option<String>,
 }
 
 impl Config {
@@ -48,6 +49,9 @@ impl Config {
                 "ffmpeg".into()
             }
         });
+        let auth_token = env::var("OVT_AUTH_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
 
         Ok(Self {
             bind,
@@ -62,6 +66,7 @@ impl Config {
             voice_ref,
             voice_ref_text,
             ffmpeg_bin,
+            auth_token,
         })
     }
 }

@@ -16,6 +16,7 @@ Core path:
 - Local translation with Ollama.
 - Local cloned/streaming TTS through a Qwen3-TTS-compatible HTTP endpoint.
 - PipeWire virtual microphone for Teams.
+- Unified Rust app with server/client modes.
 
 ## Quick commands
 
@@ -40,10 +41,37 @@ OVT_QWEN_INSTALL_DIR=$PWD/vendor/qwen3_tts_rs_cpu ./scripts/start-local-stack.sh
 
 See:
 
+- `docs/ovt-app.md`
 - `docs/teams-realtime.md`
 - `docs/meeting-client.md`
 - `docs/qwen3-tts-contract.md`
 - `docs/rust-native-inference.md`
+
+## Unified app
+
+Build and start the AudioRelay-style control app:
+
+```bash
+./scripts/build-gpu.sh
+./scripts/start-ovt-app.sh
+```
+
+Open:
+
+```text
+http://127.0.0.1:8798
+```
+
+The app lets you choose:
+
+- **Servidor GPU**: start/stop the GPU stack and release VRAM when stopped.
+- **Cliente Teams**: start/stop the meeting client and open its live controls.
+
+Smoke-test the WebSocket protocol with an existing WAV:
+
+```bash
+cargo run --release --bin ovt-ws-smoke -- /tmp/ovt-gpu-tts.wav
+```
 
 ## Remote meeting client
 
@@ -77,3 +105,4 @@ and direction switching.
 - `OVT_VOICE_REF`: optional reference voice wav for your own cloned voice
 - `OVT_VOICE_REF_TEXT`: transcript of `OVT_VOICE_REF`, required for higher-quality voice cloning
 - `OVT_FFMPEG_BIN`: ffmpeg binary, default `/snap/bin/ffmpeg` when present, otherwise `ffmpeg`
+- `OVT_AUTH_TOKEN`: optional bearer/query token for LAN clients

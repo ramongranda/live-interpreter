@@ -1,6 +1,9 @@
 # OVT Meeting Client
 
-Cliente Rust para usar el servidor GPU desde otro ordenador.
+Cliente Rust para usar el servidor GPU desde otro ordenador. La entrada
+recomendada es `ovt-app`; este binario es el motor interno del modo cliente.
+
+Ver tambien `docs/ovt-app.md`.
 
 ## Servidor GPU
 
@@ -60,9 +63,14 @@ Variables utiles:
 ```bash
 OVT_CLIENT_BIND=127.0.0.1:8790
 OVT_CLIENT_DIRECTION=es_to_en
-OVT_CLIENT_CHUNK_MS=2500
+OVT_CLIENT_VAD_THRESHOLD=0.012
+OVT_CLIENT_SILENCE_MS=800
+OVT_CLIENT_MIN_VOICE_MS=280
+OVT_CLIENT_MAX_UTTERANCE_MS=8500
+OVT_CLIENT_PRE_ROLL_MS=240
 OVT_CLIENT_PLAY_CMD=pw-play
 OVT_CLIENT_PLAY_TARGET=ovt-teams-mic-sink
+OVT_CLIENT_AUTH_TOKEN=opcional
 ```
 
 En Windows/macOS el flujo es el mismo, pero la salida debe apuntarse a un cable
