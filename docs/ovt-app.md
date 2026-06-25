@@ -21,6 +21,36 @@ Abrir:
 http://127.0.0.1:8798
 ```
 
+## Instalacion como app de escritorio
+
+```bash
+cd /home/rgranda/workspaces/olares-voice-translator
+./scripts/install-ovt-desktop.sh
+```
+
+Esto instala:
+
+- `~/.config/systemd/user/ovt-app.service`
+- `~/.local/share/applications/ovt-app.desktop`
+
+Abrir desde terminal:
+
+```bash
+./scripts/open-ovt-app.sh
+```
+
+Parar solo la consola:
+
+```bash
+systemctl --user stop ovt-app
+```
+
+Desinstalar:
+
+```bash
+./scripts/uninstall-ovt-desktop.sh
+```
+
 ## Uso en la maquina GPU
 
 Pulsa **Arrancar servidor**.

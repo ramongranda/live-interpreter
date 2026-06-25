@@ -67,6 +67,12 @@ The app lets you choose:
 - **Servidor GPU**: start/stop the GPU stack and release VRAM when stopped.
 - **Cliente Teams**: start/stop the meeting client and open its live controls.
 
+Install it as a desktop launcher and user service:
+
+```bash
+./scripts/install-ovt-desktop.sh
+```
+
 Smoke-test the WebSocket protocol with an existing WAV:
 
 ```bash
