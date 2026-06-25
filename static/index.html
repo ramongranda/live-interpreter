@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Olares Voice Translator</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 32px; max-width: 900px; }
+      textarea { width: 100%; min-height: 120px; }
+      button, select, input { font: inherit; padding: 8px; }
+      pre { background: #111; color: #eee; padding: 16px; overflow: auto; }
+      .row { display: flex; gap: 12px; align-items: center; margin: 12px 0; flex-wrap: wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>Olares Voice Translator</h1>
+    <div class="row">
+      <select id="direction">
+        <option value="es_to_en">Spanish to English</option>
+        <option value="en_to_es">English to Spanish</option>
+      </select>
+      <label><input id="synthesize" type="checkbox" /> synthesize voice</label>
+    </div>
+    <textarea id="text" placeholder="Type text to translate..."></textarea>
+    <div class="row">
+      <button id="translate">Translate text</button>
+      <input id="audio" type="file" accept="audio/*,video/*" />
+      <button id="upload">Upload audio</button>
+    </div>
+    <pre id="out"></pre>
+    <script>
+      const out = document.querySelector("#out");
+      const direction = document.querySelector("#direction");
+      const synthesize = document.querySelector("#synthesize");
+
+      document.querySelector("#translate").onclick = async () => {
+        const res = await fetch("/v1/interpret/text", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            direction: direction.value,
+            text: document.querySelector("#text").value,
+            synthesize: synthesize.checked,
+          }),
+        });
+        out.textContent = JSON.stringify(await res.json(), null, 2);
+      };
+
+      document.querySelector("#upload").onclick = async () => {
+        const file = document.querySelector("#audio").files[0];
+        const form = new FormData();
+        form.set("direction", direction.value);
+        form.set("synthesize", synthesize.checked ? "true" : "false");
+        form.set("audio", file);
+        const res = await fetch("/v1/interpret/file", { method: "POST", body: form });
+        out.textContent = JSON.stringify(await res.json(), null, 2);
+      };
+    </script>
+  </body>
+</html>
