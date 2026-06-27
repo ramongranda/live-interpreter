@@ -17,12 +17,12 @@ use crate::desktop::{DesktopConfig, GpuPreflight};
 use anyhow::{Context, Result, anyhow, bail};
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enums::device::UsedGpuMemory;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tokio::process::Command;
 
 /// Per-process GPU memory, in MiB.
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GpuProcessMem {
     pub pid: u32,
     pub name: String,
@@ -36,6 +36,7 @@ pub struct VramSnapshot {
     pub total_mb: u64,
     pub free_mb: u64,
     pub used_mb: u64,
+    pub utilization_pct: u8,
     pub source: &'static str,
     pub processes: Vec<GpuProcessMem>,
 }
@@ -79,11 +80,17 @@ pub fn nvml_snapshot() -> Result<VramSnapshot> {
     let mut processes: Vec<GpuProcessMem> = by_pid.into_values().collect();
     processes.sort_by(|a, b| b.used_mb.cmp(&a.used_mb));
 
+    let utilization_pct = device
+        .utilization_rates()
+        .map(|u| u.gpu.min(100) as u8)
+        .unwrap_or(0);
+
     Ok(VramSnapshot {
         device_name,
         total_mb: mem.total / (1024 * 1024),
         free_mb: mem.free / (1024 * 1024),
         used_mb: mem.used / (1024 * 1024),
+        utilization_pct,
         source: "nvml",
         processes,
     })
@@ -93,7 +100,7 @@ pub fn nvml_snapshot() -> Result<VramSnapshot> {
 async fn nvidia_smi_snapshot() -> Result<VramSnapshot> {
     let summary = Command::new("nvidia-smi")
         .args([
-            "--query-gpu=name,memory.total,memory.free,memory.used",
+            "--query-gpu=name,memory.total,memory.free,memory.used,utilization.gpu",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -113,6 +120,11 @@ async fn nvidia_smi_snapshot() -> Result<VramSnapshot> {
     let total_mb = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
     let free_mb = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
     let used_mb = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let utilization_pct = fields
+        .next()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|p| p.min(100) as u8)
+        .unwrap_or(0);
 
     let apps = Command::new("nvidia-smi")
         .args([
@@ -141,6 +153,7 @@ async fn nvidia_smi_snapshot() -> Result<VramSnapshot> {
         total_mb,
         free_mb,
         used_mb,
+        utilization_pct,
         source: "nvidia-smi",
         processes,
     })
@@ -218,6 +231,40 @@ pub async fn gpu_preflight_realtime(min_vram_mb: u64) -> GpuPreflight {
         Err(error) => GpuPreflight {
             ready: false,
             message: format!("Servidor GPU bloqueado: no se pudo leer la VRAM ({error:#})"),
+        },
+    }
+}
+
+/// Pure mapper: project a VRAM snapshot into the UI-facing `GpuStatus`. `None`
+/// (probe failed) yields a not-capable status with a Spanish gate message.
+pub fn build_gpu_status(
+    snapshot: Option<&VramSnapshot>,
+    min_vram_mb: u64,
+) -> crate::types::GpuStatus {
+    use crate::types::GpuStatus;
+    match snapshot {
+        Some(snap) => {
+            let preflight = evaluate_preflight(snap, min_vram_mb);
+            GpuStatus {
+                is_capable: preflight.ready,
+                model_name: snap.device_name.clone(),
+                vram_free_mb: snap.free_mb,
+                vram_total_mb: snap.total_mb,
+                utilization_pct: snap.utilization_pct,
+                gate_message: preflight.message,
+                processes: snap.processes.clone(),
+                source: snap.source.to_string(),
+            }
+        }
+        None => GpuStatus {
+            is_capable: false,
+            model_name: "GPU desconocida".into(),
+            vram_free_mb: 0,
+            vram_total_mb: 0,
+            utilization_pct: 0,
+            gate_message: "Servidor GPU bloqueado: no se pudo leer la VRAM".into(),
+            processes: Vec::new(),
+            source: "unavailable".into(),
         },
     }
 }
@@ -413,9 +460,120 @@ impl VramOrchestrator {
     }
 }
 
+/// Default model ladders for this deployment. VRAM costs are **estimates** — tune to your hardware,
+/// and ensure each `model_ref` is a real Ollama tag / GGUF path / whisper model present on disk.
+pub fn default_ladders() -> Vec<ModelLadder> {
+    vec![
+        ModelLadder {
+            name: "llm".into(),
+            tiers: vec![
+                ModelTier {
+                    label: "fp16".into(),
+                    vram_mb: 8000,
+                    model_ref: "translator:fp16".into(),
+                },
+                ModelTier {
+                    label: "q8".into(),
+                    vram_mb: 5000,
+                    model_ref: "translator:q8_0".into(),
+                },
+                ModelTier {
+                    label: "q4".into(),
+                    vram_mb: 2500,
+                    model_ref: "translator:q4_K_M".into(),
+                },
+            ],
+        },
+        ModelLadder {
+            name: "asr".into(),
+            tiers: vec![
+                ModelTier {
+                    label: "large-v3-turbo".into(),
+                    vram_mb: 1600,
+                    model_ref: "data/models/ggml-large-v3-turbo.bin".into(),
+                },
+                ModelTier {
+                    label: "small".into(),
+                    vram_mb: 600,
+                    model_ref: "data/models/ggml-small.bin".into(),
+                },
+            ],
+        },
+        ModelLadder {
+            name: "tts".into(),
+            tiers: vec![ModelTier {
+                label: "0.6b".into(),
+                vram_mb: 1200,
+                model_ref: "Qwen/Qwen3-TTS-12Hz-0.6B-Base".into(),
+            }],
+        },
+    ]
+}
+
+/// Env var the selected tier's `model_ref` is injected into at server launch (read by `config.rs`).
+fn launch_env_key(model: &str) -> Option<&'static str> {
+    match model {
+        "llm" => Some("LI_OLLAMA_MODEL"),
+        "asr" => Some("LI_WHISPER_MODEL"),
+        "tts" => Some("LI_QWEN_TTS_MODEL"),
+        _ => None,
+    }
+}
+
+/// Run the budgeter against a live snapshot and produce the env overrides to launch the stack with.
+/// Errors (refuses launch) when even the smallest tier set oversubscribes physical VRAM — closing
+/// the budget->launch loop without letting the driver swap to system RAM.
+pub fn select_launch_env(
+    snapshot: &VramSnapshot,
+    ladders: &[ModelLadder],
+) -> Result<(VramPlan, Vec<(String, String)>)> {
+    let plan = VramOrchestrator::default().plan(snapshot.total_mb, snapshot.free_mb, ladders)?;
+    if let VramDecision::Reject {
+        needed_mb,
+        available_mb,
+        missing_mb,
+    } = plan.decision
+    {
+        bail!(
+            "Servidor GPU bloqueado: los modelos necesitan {needed_mb} MiB pero solo caben \
+             {available_mb} MiB en VRAM fisica (faltan {missing_mb} MiB). Evitando swap a RAM."
+        );
+    }
+    let envs = plan
+        .selected
+        .iter()
+        .filter_map(|sel| {
+            launch_env_key(&sel.model).map(|key| (key.to_string(), sel.model_ref.clone()))
+        })
+        .collect();
+    Ok((plan, envs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snap(total_mb: u64, free_mb: u64) -> VramSnapshot {
+        VramSnapshot {
+            device_name: "GPU".into(),
+            total_mb,
+            free_mb,
+            used_mb: total_mb - free_mb,
+            utilization_pct: 0,
+            source: "nvml",
+            processes: vec![],
+        }
+    }
+
+    #[test]
+    fn select_launch_env_injects_refs_and_rejects_oversubscription() {
+        let (plan, envs) = select_launch_env(&snap(16000, 16000), &default_ladders()).unwrap();
+        assert_eq!(plan.decision, VramDecision::Fit);
+        assert!(envs.iter().any(|(k, _)| k == "LI_OLLAMA_MODEL"));
+        assert!(envs.iter().any(|(k, _)| k == "LI_WHISPER_MODEL"));
+        // 2 GiB card cannot hold even the lowest tiers => refuse launch.
+        assert!(select_launch_env(&snap(2000, 2000), &default_ladders()).is_err());
+    }
 
     fn ladders() -> Vec<ModelLadder> {
         vec![
@@ -522,6 +680,7 @@ mod tests {
             total_mb: 16000,
             free_mb: 3000,
             used_mb: 13000,
+            utilization_pct: 0,
             source: "nvml",
             processes: vec![
                 GpuProcessMem {
@@ -549,6 +708,7 @@ mod tests {
             total_mb: 16000,
             free_mb: 12000,
             used_mb: 4000,
+            utilization_pct: 0,
             source: "nvml",
             processes: vec![],
         };
@@ -573,6 +733,7 @@ mod tests {
             total_mb: 16000,
             free_mb: 4000,
             used_mb: 12000,
+            utilization_pct: 0,
             source: "nvml",
             processes: vec![
                 GpuProcessMem {

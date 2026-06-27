@@ -1,8 +1,13 @@
 pub mod asr;
 pub mod config;
 pub mod desktop;
+pub mod events;
 pub mod mesh;
+pub mod pipeline;
+pub mod runtime;
 pub mod translate;
 pub mod tts;
 pub mod types;
+pub mod virtual_mic;
+pub mod voice;
 pub mod vram;

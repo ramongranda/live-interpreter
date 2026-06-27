@@ -99,10 +99,30 @@ impl<'a> QwenTtsRequest<'a> {
         audio_sample: Option<&'a str>,
         audio_sample_text: Option<&'a str>,
     ) -> Self {
+        Self::for_language(
+            text,
+            direction.target_tts_language(),
+            model,
+            voice,
+            audio_sample,
+            audio_sample_text,
+        )
+    }
+
+    /// Build a request given the target TTS language directly (used by the
+    /// `VoiceSynthesisBackend` adapter, which carries a `Lang`, not a `Direction`).
+    pub(crate) fn for_language(
+        text: &'a str,
+        language: &'a str,
+        model: &'a str,
+        voice: &'a str,
+        audio_sample: Option<&'a str>,
+        audio_sample_text: Option<&'a str>,
+    ) -> Self {
         Self {
             text,
             model,
-            language: direction.target_tts_language(),
+            language,
             input: text,
             voice,
             audio_sample,

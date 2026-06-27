@@ -4,13 +4,8 @@
 //! (an enum, not `dyn`) so `AppState` stays `Clone` and we avoid an `async-trait` dependency in a
 //! codebase that otherwise uses native `async fn` in traits. Two backends:
 //!
-//! - [`HttpTranslator`] (default): the original Ollama HTTP client.
-//! - [`candle::CandleTranslator`] (feature `translate-candle`): in-process quantized Qwen2 (GGUF)
-//!   inference via `candle`, removing the Ollama hop entirely.
-//!
-//! `translate_stream` exposes a token stream so first-token latency is measurable (see
-//! `benches/translate_latency.rs`). For HTTP it yields a single chunk (non-streaming); for candle
-//! it yields one item per decoded token.
+//! Single backend [`HttpTranslator`]: the Ollama HTTP client. `translate_stream` yields the full
+//! translation as one chunk (non-streaming), used by `benches/translate_latency.rs`.
 
 use crate::types::Direction;
 use anyhow::Result;
@@ -20,9 +15,6 @@ use std::{collections::VecDeque, pin::Pin, time::Duration};
 
 mod http;
 pub use http::HttpTranslator;
-
-#[cfg(feature = "translate-candle")]
-pub mod candle;
 
 /// Boxed token stream. First `.next().await` marks time-to-first-token.
 pub type TokenStream = Pin<Box<dyn Stream<Item = Result<String>> + Send>>;
@@ -125,66 +117,26 @@ impl TranslationBuffer {
     }
 }
 
-/// Pluggable translation backend. Variant chosen at startup by [`Translator::from_env`].
+/// Translation backend: the Ollama HTTP client.
 #[derive(Clone)]
-pub enum Translator {
-    Http(HttpTranslator),
-    #[cfg(feature = "translate-candle")]
-    Candle(candle::CandleTranslator),
-}
+pub struct Translator(HttpTranslator);
 
 impl Translator {
-    /// Select a backend from `LI_TRANSLATE_BACKEND` (`http` | `candle`). Defaults to HTTP.
-    ///
-    /// Candle paths come from `LI_CANDLE_GGUF`, `LI_CANDLE_TOKENIZER`, `LI_CANDLE_MAX_TOKENS`.
+    /// Build the Ollama HTTP translator.
     pub fn from_env(ollama_url: String, ollama_model: String) -> Result<Self> {
-        match std::env::var("LI_TRANSLATE_BACKEND").ok().as_deref() {
-            Some("candle") => {
-                #[cfg(feature = "translate-candle")]
-                {
-                    let gguf = std::env::var("LI_CANDLE_GGUF")
-                        .unwrap_or_else(|_| "data/models/qwen2.5-0.5b-instruct-q4_k_m.gguf".into());
-                    let tokenizer = std::env::var("LI_CANDLE_TOKENIZER")
-                        .unwrap_or_else(|_| "data/models/qwen2-tokenizer.json".into());
-                    let max_tokens = std::env::var("LI_CANDLE_MAX_TOKENS")
-                        .ok()
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or(512);
-                    Ok(Self::Candle(candle::CandleTranslator::load(
-                        &gguf, &tokenizer, max_tokens,
-                    )?))
-                }
-                #[cfg(not(feature = "translate-candle"))]
-                anyhow::bail!(
-                    "LI_TRANSLATE_BACKEND=candle but this binary was built without --features translate-candle"
-                )
-            }
-            _ => Ok(Self::Http(HttpTranslator::new(ollama_url, ollama_model))),
-        }
+        Ok(Self(HttpTranslator::new(ollama_url, ollama_model)))
     }
 
     pub async fn translate(&self, text: &str, direction: &Direction) -> Result<String> {
-        match self {
-            Translator::Http(backend) => backend.translate(text, direction).await,
-            #[cfg(feature = "translate-candle")]
-            Translator::Candle(backend) => backend.translate(text, direction).await,
-        }
+        self.0.translate(text, direction).await
     }
 
     pub async fn observe_silence(&self, silence: Duration) {
-        match self {
-            Translator::Http(backend) => backend.observe_silence(silence).await,
-            #[cfg(feature = "translate-candle")]
-            Translator::Candle(_) => {}
-        }
+        self.0.observe_silence(silence).await
     }
 
     pub async fn translate_stream(&self, text: &str, direction: &Direction) -> Result<TokenStream> {
-        match self {
-            Translator::Http(backend) => backend.translate_stream(text, direction).await,
-            #[cfg(feature = "translate-candle")]
-            Translator::Candle(backend) => backend.translate_stream(text, direction).await,
-        }
+        self.0.translate_stream(text, direction).await
     }
 }
 
