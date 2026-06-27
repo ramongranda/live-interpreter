@@ -1,8 +1,10 @@
 pub mod asr;
+pub mod capture;
 pub mod config;
 pub mod desktop;
 pub mod events;
 pub mod mesh;
+pub mod mesh_pipeline;
 pub mod pipeline;
 pub mod runtime;
 pub mod translate;

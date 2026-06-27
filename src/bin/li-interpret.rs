@@ -14,7 +14,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc as std_mpsc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -23,9 +22,8 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::{Json, Router};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, StreamConfig};
 use live_interpreter::asr::AsrEngine;
+use live_interpreter::capture::{self, CaptureConfig};
 use live_interpreter::config::Config;
 use live_interpreter::events::EventHub;
 use live_interpreter::pipeline::interpret_utterance_chunked;
@@ -50,10 +48,6 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
-
-const VAD_THRESHOLD: f32 = 0.012;
-const SILENCE_MS: u64 = 700;
-const MIN_VOICE_MS: u64 = 300;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -105,28 +99,16 @@ async fn main() -> Result<()> {
         });
     }
 
-    // cpal capture → mono f32 buffers over a sync channel.
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .context("no default input device")?;
-    let supported = device.default_input_config()?;
-    let sample_format = supported.sample_format();
-    let stream_config: StreamConfig = supported.clone().into();
-    let sample_rate = stream_config.sample_rate.0;
-    let channels = stream_config.channels as usize;
-
-    let (raw_tx, raw_rx) = std_mpsc::channel::<Vec<f32>>();
-    let stream = build_input_stream(&device, &stream_config, sample_format, channels, raw_tx)?;
-    stream.play()?;
+    // Shared cpal capture + energy-VAD utterance segmentation.
+    let cap = capture::start_capture(CaptureConfig::default())?;
+    let sample_rate = cap.sample_rate;
+    let _capture_stream = cap.stream; // hold to keep the device open
+    let mut utt_rx = cap.utterances;
     tracing::info!(
-        "listening on default mic ({sample_rate} Hz, {channels} ch) → speak Spanish; \
-         output on 'live-interpreter-mic-source'"
+        "listening on default mic ({sample_rate} Hz, {} ch) → speak Spanish; \
+         output on 'live-interpreter-mic-source'",
+        cap.channels
     );
-
-    // VAD utterance segmentation on a blocking thread → completed utterances to async.
-    let (utt_tx, mut utt_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
-    std::thread::spawn(move || segment_utterances(raw_rx, sample_rate, utt_tx));
 
     let uploads = config.data_dir.join("uploads");
     tokio::fs::create_dir_all(&uploads).await.ok();
@@ -134,7 +116,7 @@ async fn main() -> Result<()> {
     while let Some(utterance) = utt_rx.recv().await {
         let id = Uuid::new_v4();
         let wav_path = uploads.join(format!("{id}-capture.wav"));
-        if let Err(error) = write_wav_16le(&wav_path, &utterance, sample_rate) {
+        if let Err(error) = capture::write_wav_16le(&wav_path, &utterance, sample_rate) {
             tracing::error!("wav write failed: {error:#}");
             continue;
         }
@@ -226,106 +208,6 @@ fn log_events(events: &[PipelineEvent], latency_ms: u64) {
         .filter(|e| matches!(e, PipelineEvent::AudioFrame { .. }))
         .count();
     tracing::info!("→ {frames} audio chunk(s) to virtual mic ({latency_ms} ms)");
-}
-
-/// Energy-based VAD: accumulate while RMS exceeds threshold; flush after silence.
-fn segment_utterances(
-    raw_rx: std_mpsc::Receiver<Vec<f32>>,
-    sample_rate: u32,
-    utt_tx: tokio::sync::mpsc::UnboundedSender<Vec<f32>>,
-) {
-    let silence_samples = (sample_rate as u64 * SILENCE_MS / 1000) as usize;
-    let min_voice_samples = (sample_rate as u64 * MIN_VOICE_MS / 1000) as usize;
-    let mut utterance: Vec<f32> = Vec::new();
-    let mut voiced = 0usize;
-    let mut silence = 0usize;
-
-    while let Ok(frame) = raw_rx.recv() {
-        let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len().max(1) as f32).sqrt();
-        let speaking = rms >= VAD_THRESHOLD;
-        if speaking {
-            voiced += frame.len();
-            silence = 0;
-            utterance.extend_from_slice(&frame);
-        } else if !utterance.is_empty() {
-            silence += frame.len();
-            utterance.extend_from_slice(&frame);
-            if silence >= silence_samples {
-                if voiced >= min_voice_samples {
-                    let _ = utt_tx.send(std::mem::take(&mut utterance));
-                } else {
-                    utterance.clear();
-                }
-                voiced = 0;
-                silence = 0;
-            }
-        }
-    }
-}
-
-fn build_input_stream(
-    device: &cpal::Device,
-    config: &StreamConfig,
-    format: SampleFormat,
-    channels: usize,
-    tx: std_mpsc::Sender<Vec<f32>>,
-) -> Result<cpal::Stream> {
-    let err = |e| tracing::error!("cpal stream error: {e}");
-    let stream = match format {
-        SampleFormat::F32 => device.build_input_stream(
-            config,
-            move |data: &[f32], _| {
-                let _ = tx.send(mono(data, channels, |s| s));
-            },
-            err,
-            None,
-        )?,
-        SampleFormat::I16 => device.build_input_stream(
-            config,
-            move |data: &[i16], _| {
-                let _ = tx.send(mono(data, channels, |s| s as f32 / i16::MAX as f32));
-            },
-            err,
-            None,
-        )?,
-        SampleFormat::U16 => device.build_input_stream(
-            config,
-            move |data: &[u16], _| {
-                let _ = tx.send(mono(data, channels, |s| {
-                    (s as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0)
-                }));
-            },
-            err,
-            None,
-        )?,
-        other => anyhow::bail!("unsupported sample format {other:?}"),
-    };
-    Ok(stream)
-}
-
-fn mono<T: Copy>(data: &[T], channels: usize, conv: impl Fn(T) -> f32) -> Vec<f32> {
-    if channels <= 1 {
-        return data.iter().map(|&s| conv(s)).collect();
-    }
-    data.chunks(channels)
-        .map(|frame| frame.iter().map(|&s| conv(s)).sum::<f32>() / channels as f32)
-        .collect()
-}
-
-fn write_wav_16le(path: &std::path::Path, samples: &[f32], sample_rate: u32) -> Result<()> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut writer = hound::WavWriter::create(path, spec)?;
-    for &sample in samples {
-        let clamped = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-        writer.write_sample(clamped)?;
-    }
-    writer.finalize()?;
-    Ok(())
 }
 
 fn clone_profile(path: PathBuf) -> VoiceProfile {

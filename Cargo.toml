@@ -59,3 +59,8 @@ required-features = ["native-audio"]
 [[bin]]
 name = "li-control"
 path = "src/bin/li-control.rs"
+
+[[bin]]
+name = "li-mesh"
+path = "src/bin/li-mesh.rs"
+required-features = ["native-audio"]
