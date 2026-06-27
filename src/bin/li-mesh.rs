@@ -35,7 +35,7 @@ use live_interpreter::mesh::{
     NoopGpuTelemetry, NvmlGpuTelemetry, RejectingAudioProcessor, VoiceReference,
 };
 use live_interpreter::mesh_pipeline::{PipelineMeshProcessor, f32_to_pcm_s16le};
-use live_interpreter::pipeline::Transcriber;
+use live_interpreter::pipeline::{Transcriber, split_clauses};
 use live_interpreter::quality::QualityTier;
 use live_interpreter::translate::Translator;
 use live_interpreter::types::{AudioSpec, Direction, Lane, Lang};
@@ -307,7 +307,7 @@ async fn run_bench() -> Result<()> {
             "n/a".into()
         };
         println!(
-            "#{:<2} asr={:>7} translate={:>7} tts_first={:>7} tts_full={:>7} total={:>7} ttfa={:>7} rtf={}",
+            "#{:<2} asr={:>7} translate={:>7} tts_first={:>7} tts_full={:>7} total={:>7} ttfa={:>7} clauses={} rtf={}",
             i + 1,
             r.asr.map(fmt_ms).unwrap_or_else(|| "—".into()),
             fmt_ms(r.translate),
@@ -315,6 +315,7 @@ async fn run_bench() -> Result<()> {
             fmt_ms(r.tts_full),
             fmt_ms(r.total),
             fmt_ms(r.ttfa),
+            r.clauses,
             rtf,
         );
         ttfa_samples.push(r.ttfa);
@@ -350,6 +351,7 @@ struct StageTimings {
     tts_full: Duration,
     total: Duration,
     ttfa: Duration,
+    clauses: usize,
     transcript: String,
     translation: String,
 }
@@ -384,26 +386,34 @@ async fn bench_once(
     let translation = translator.translate(&transcript, &direction).await?;
     let translate = t.elapsed();
 
-    let (tts_first, tts_full) = if route == VoiceRoute::Off {
+    // Clause-chunked synthesis, mirroring the real pipeline (R7): the TTS service
+    // can't stream (stream:true → 400) and serializes, so the only latency lever
+    // is splitting the translation into clauses and playing the first one ASAP.
+    // tts_first = time the first clause finishes (the real time-to-first-audio);
+    // tts_full = all clauses synthesized in order.
+    let clauses: Vec<String> = split_clauses(&translation)
+        .into_iter()
+        .filter(|clause| !clause.trim().is_empty())
+        .collect();
+    let (tts_first, tts_full) = if route == VoiceRoute::Off || clauses.is_empty() {
         (Duration::ZERO, Duration::ZERO)
     } else {
-        let request = VoiceSynthesisRequest {
-            text: translation.clone(),
-            lang: target_lang,
-            profile: profile.clone(),
-            neutral: route == VoiceRoute::Neutral,
-        };
         let t = Instant::now();
-        let mut stream = voice.synthesize_stream(request).await?;
-        let first = stream.next().await;
-        let tts_first = t.elapsed();
-        if let Some(frame) = first {
-            frame?;
+        let mut first = None;
+        for clause in &clauses {
+            let request = VoiceSynthesisRequest {
+                text: clause.clone(),
+                lang: target_lang,
+                profile: profile.clone(),
+                neutral: route == VoiceRoute::Neutral,
+            };
+            let mut stream = voice.synthesize_stream(request).await?;
+            while let Some(frame) = stream.next().await {
+                frame?;
+            }
+            first.get_or_insert_with(|| t.elapsed());
         }
-        while let Some(frame) = stream.next().await {
-            frame?;
-        }
-        (tts_first, t.elapsed())
+        (first.unwrap_or(Duration::ZERO), t.elapsed())
     };
 
     let total = overall.elapsed();
@@ -415,6 +425,7 @@ async fn bench_once(
         tts_full,
         total,
         ttfa,
+        clauses: clauses.len(),
         transcript,
         translation,
     })

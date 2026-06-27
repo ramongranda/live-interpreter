@@ -225,14 +225,39 @@ async fn render_chunks(
     Ok(())
 }
 
-/// Split text into clause-sized chunks on sentence terminators, keeping the
-/// punctuation. Pure; no-punctuation text yields a single chunk.
+/// Split text into clause-sized chunks for low-latency synthesis: the first
+/// chunk is spoken while later chunks are still being synthesized, so the metric
+/// that matters (time-to-first-audio) tracks the *first* chunk, not the whole
+/// utterance.
+///
+/// The TTS service can't stream and its latency scales with text length (≈linear
+/// after a ~1s fixed per-call overhead — measured via the R11.1 bench), so the
+/// split balances two pressures: chunks too short waste the fixed overhead and
+/// sound choppy; chunks too long delay the first audio. It breaks on
+///
+/// * **sentence terminators** (`.!?;…`) — always;
+/// * **soft separators** (`,:—`) — only once the chunk is long enough to be worth
+///   a separate call (`MIN_SOFT_CHARS`), so "Hello, ..." doesn't split off "Hello,";
+/// * **length** — a run-on with no usable punctuation is force-broken at a word
+///   boundary near `MAX_CHARS`, bounding first-audio regardless of punctuation.
+///
+/// A runt trailing chunk is merged back into the previous one. Pure; no-punctuation
+/// short text yields a single chunk (preserving the original behavior).
 pub fn split_clauses(text: &str) -> Vec<String> {
+    // Per-call TTS overhead is ~1s, so don't split below MIN_SOFT_CHARS; above
+    // MAX_CHARS the first chunk takes too long, so force a word-boundary break.
+    const MIN_SOFT_CHARS: usize = 24;
+    const MAX_CHARS: usize = 72;
+
     let mut clauses = Vec::new();
     let mut current = String::new();
     for ch in text.chars() {
         current.push(ch);
-        if matches!(ch, '.' | '!' | '?' | ';' | '…') {
+        let len = current.trim().chars().count();
+        let hard = matches!(ch, '.' | '!' | '?' | ';' | '…');
+        let soft = matches!(ch, ',' | ':' | '—') && len >= MIN_SOFT_CHARS;
+        let too_long = len >= MAX_CHARS && ch.is_whitespace();
+        if hard || soft || too_long {
             let trimmed = current.trim();
             if !trimmed.is_empty() {
                 clauses.push(trimmed.to_string());
@@ -240,9 +265,16 @@ pub fn split_clauses(text: &str) -> Vec<String> {
             current.clear();
         }
     }
-    let tail = current.trim();
+    let tail = current.trim().to_string();
     if !tail.is_empty() {
-        clauses.push(tail.to_string());
+        // Merge a runt tail into the previous chunk rather than emit a tiny call.
+        match clauses.last_mut() {
+            Some(last) if tail.chars().count() < MIN_SOFT_CHARS => {
+                last.push(' ');
+                last.push_str(&tail);
+            }
+            _ => clauses.push(tail),
+        }
     }
     if clauses.is_empty() {
         let whole = text.trim();
@@ -353,6 +385,47 @@ mod tests {
         assert_eq!(split_clauses("just a phrase"), vec!["just a phrase"]);
         // Whitespace/empty → no empty chunks.
         assert!(split_clauses("   ").is_empty());
+    }
+
+    #[test]
+    fn split_clauses_breaks_on_long_commas_but_not_short_ones() {
+        // Comma after a long-enough run → a separate chunk (lower first-audio).
+        assert_eq!(
+            split_clauses("quiero probar el sistema de hoy, y medir la latencia del audio."),
+            vec![
+                "quiero probar el sistema de hoy,",
+                "y medir la latencia del audio."
+            ]
+        );
+        // Early short comma → not worth its own TTS call, stays in one chunk.
+        assert_eq!(
+            split_clauses("Hola, bienvenido."),
+            vec!["Hola, bienvenido."]
+        );
+    }
+
+    #[test]
+    fn split_clauses_force_breaks_run_on_without_punctuation() {
+        // A long run-on with no usable punctuation must still chunk, so the first
+        // audio isn't gated on synthesizing the whole thing.
+        let run_on = "uno dos tres cuatro cinco seis siete ocho nueve diez once doce \
+                      trece catorce quince dieciseis diecisiete dieciocho";
+        let chunks = split_clauses(run_on);
+        assert!(chunks.len() >= 2, "run-on should force-break: {chunks:?}");
+        assert!(
+            chunks[0].chars().count() <= 80,
+            "first chunk bounds first-audio: {:?}",
+            chunks[0]
+        );
+    }
+
+    #[test]
+    fn split_clauses_merges_runt_tail() {
+        // A tiny trailing fragment folds into the previous chunk (no 1s call for "ok").
+        assert_eq!(
+            split_clauses("This is a reasonably long first sentence here. ok"),
+            vec!["This is a reasonably long first sentence here. ok"]
+        );
     }
 
     #[tokio::test]
