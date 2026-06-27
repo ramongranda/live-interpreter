@@ -11,13 +11,13 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use live_interpreter::mesh::{
-    AudioChunk, AudioTaskResult, GpuTelemetry, GpuTelemetrySnapshot, LiveInterpreterMesh,
+    AudioChunk, AudioSegment, GpuTelemetry, GpuTelemetrySnapshot, LiveInterpreterMesh,
     MeshAudioProcessor, MeshCommand, MeshConfig, MeshRole, NoopGpuTelemetry,
     RejectingAudioProcessor,
 };
 use live_interpreter::types::Direction;
 use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 struct FixedTelemetry;
@@ -33,21 +33,46 @@ impl GpuTelemetry for FixedTelemetry {
     }
 }
 
-/// Stands in for the real pipeline: echoes a canned translated result.
+/// Stands in for the real pipeline: streams two canned clauses, exercising the
+/// bidirectional clause-by-clause delivery (R11.6 over the mesh).
 struct EchoProcessor;
 
 #[async_trait]
 impl MeshAudioProcessor for EchoProcessor {
-    async fn process(&self, chunk: AudioChunk) -> Result<AudioTaskResult> {
-        Ok(AudioTaskResult {
-            session_id: chunk.session_id,
-            sequence: chunk.sequence,
-            transcription: "hola mundo".into(),
-            translation: "hello world".into(),
-            tts_sample_rate_hz: 24_000,
-            tts_output: vec![0.1, 0.2, 0.3],
-            meta: None,
-        })
+    async fn process_stream(
+        &self,
+        chunk: AudioChunk,
+        segments: mpsc::Sender<AudioSegment>,
+    ) -> Result<()> {
+        let _ = segments
+            .send(AudioSegment {
+                session_id: chunk.session_id,
+                sequence: chunk.sequence,
+                clause_index: 0,
+                last: false,
+                transcription: "hola mundo".into(),
+                translation: "hello".into(),
+                tts_sample_rate_hz: 24_000,
+                tts_output: vec![0.1, 0.2],
+                meta: None,
+                auth_token: None,
+            })
+            .await;
+        let _ = segments
+            .send(AudioSegment {
+                session_id: chunk.session_id,
+                sequence: chunk.sequence,
+                clause_index: 1,
+                last: true,
+                transcription: String::new(),
+                translation: "world".into(),
+                tts_sample_rate_hz: 24_000,
+                tts_output: vec![0.3],
+                meta: None,
+                auth_token: None,
+            })
+            .await;
+        Ok(())
     }
 }
 
@@ -95,29 +120,46 @@ async fn audio_task_round_trips_provider_to_consumer() {
         auth_token: None,
     };
 
-    // Poll: SubmitAudio fails fast while no provider is known yet, so retry until
-    // mDNS + gossipsub have populated the provider table (or we give up).
-    let result = tokio::time::timeout(Duration::from_secs(40), async {
+    // Poll: while no provider is known the sink closes immediately (recv → None),
+    // so retry until mDNS + gossipsub populate the provider table, then collect
+    // the streamed clauses until `last`.
+    let segments = tokio::time::timeout(Duration::from_secs(40), async {
         loop {
-            let (reply_tx, reply_rx) = oneshot::channel();
+            let (seg_tx, mut seg_rx) = mpsc::channel(16);
             c_cmd
                 .send(MeshCommand::SubmitAudio {
                     chunk: chunk.clone(),
-                    reply: reply_tx,
+                    segments: seg_tx,
                 })
                 .await
                 .expect("consumer mesh task alive");
-            match reply_rx.await.expect("reply channel") {
-                Ok(result) => break result,
-                Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+            match tokio::time::timeout(Duration::from_secs(2), seg_rx.recv()).await {
+                Ok(Some(first)) => {
+                    let mut collected = vec![first];
+                    while let Some(segment) = seg_rx.recv().await {
+                        let last = segment.last;
+                        collected.push(segment);
+                        if last {
+                            break;
+                        }
+                    }
+                    break collected;
+                }
+                // No provider yet (closed) or still discovering (timeout) → retry.
+                _ => tokio::time::sleep(Duration::from_millis(500)).await,
             }
         }
     })
     .await
-    .expect("mesh round-trip within 40s (mDNS may be blocked in this environment)");
+    .expect("mesh stream within 40s (mDNS may be blocked in this environment)");
 
-    assert_eq!(result.transcription, "hola mundo");
-    assert_eq!(result.translation, "hello world");
-    assert_eq!(result.tts_sample_rate_hz, 24_000);
-    assert_eq!(result.tts_output, vec![0.1, 0.2, 0.3]);
+    assert_eq!(segments.len(), 2, "two clauses stream back");
+    assert_eq!(segments[0].clause_index, 0);
+    assert_eq!(segments[0].transcription, "hola mundo");
+    assert_eq!(segments[0].translation, "hello");
+    assert!(!segments[0].last);
+    assert_eq!(segments[1].clause_index, 1);
+    assert_eq!(segments[1].translation, "world");
+    assert!(segments[1].last);
+    assert_eq!(segments[1].tts_output, vec![0.3]);
 }

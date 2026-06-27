@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     io,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -85,18 +86,53 @@ pub struct AudioChunk {
     pub auth_token: Option<String>,
 }
 
+/// One synthesized clause of a streamed interpretation. The provider emits these
+/// as each clause finishes (clause 0 first), so the consumer plays clause 1 while
+/// the provider is still synthesizing clause 2 — the distributed analog of the
+/// local chunked pipeline (R7), lowering time-to-first-audio over the mesh.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct AudioTaskResult {
+pub struct AudioSegment {
     pub session_id: Uuid,
     pub sequence: u64,
+    /// 0-based clause index within the utterance.
+    pub clause_index: u32,
+    /// True on the final clause of this utterance.
+    pub last: bool,
+    /// Full utterance transcription, carried on clause 0 (empty on later clauses).
     pub transcription: String,
+    /// This clause's translated text.
     pub translation: String,
     pub tts_sample_rate_hz: u32,
     pub tts_output: Vec<f32>,
-    /// R11.4 — provenance of the synthesized audio; `None` when nothing was
-    /// rendered (e.g. text-only) or provenance was disabled.
+    /// R11.4 — provenance of the synthesized audio; `None` when no audio.
     pub meta: Option<GeneratedAudioMeta>,
+    /// Shared mesh secret, so the consumer can authorize an inbound delivery.
+    pub auth_token: Option<String>,
+}
+
+/// Audio-protocol request. A consumer **submits** an utterance; the provider
+/// **delivers** each synthesized clause back as a separate request, so audio
+/// streams clause-by-clause instead of waiting for the whole utterance.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub enum AudioRequest {
+    /// Consumer → provider: interpret this utterance.
+    Submit(AudioChunk),
+    /// Provider → consumer: one finished clause of the interpretation.
+    Deliver(AudioSegment),
+}
+
+/// Audio-protocol response (acks only; the payload travels as `Deliver` requests).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioResponse {
+    /// Submit accepted; clauses will follow as `Deliver` requests.
+    Accepted,
+    /// A delivered clause was received.
+    DeliverAck,
+    /// Unauthorized, or this node isn't a provider.
+    Rejected,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -148,7 +184,10 @@ impl ProviderScore {
 pub enum MeshCommand {
     SubmitAudio {
         chunk: AudioChunk,
-        reply: oneshot::Sender<anyhow::Result<AudioTaskResult>>,
+        /// Sink the consumer reads: the provider's clauses arrive here in order as
+        /// they finish. Closes after the `last` clause (success) or when routing
+        /// gives up with no provider (failure → channel closes with no `last`).
+        segments: mpsc::Sender<AudioSegment>,
     },
     SetRole(MeshRole),
     Shutdown,
@@ -161,7 +200,15 @@ pub trait GpuTelemetry: Send + Sync + 'static {
 
 #[async_trait]
 pub trait MeshAudioProcessor: Send + Sync + 'static {
-    async fn process(&self, chunk: AudioChunk) -> anyhow::Result<AudioTaskResult>;
+    /// Interpret `chunk`, emitting one [`AudioSegment`] per clause through
+    /// `segments` as each finishes (clause 0 first, `last` on the final one), so
+    /// the consumer can play clause 1 while clause 2 is still being synthesized.
+    /// Returning `Ok(())` ends the stream.
+    async fn process_stream(
+        &self,
+        chunk: AudioChunk,
+        segments: mpsc::Sender<AudioSegment>,
+    ) -> anyhow::Result<()>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -210,7 +257,11 @@ pub struct RejectingAudioProcessor;
 
 #[async_trait]
 impl MeshAudioProcessor for RejectingAudioProcessor {
-    async fn process(&self, _chunk: AudioChunk) -> anyhow::Result<AudioTaskResult> {
+    async fn process_stream(
+        &self,
+        _chunk: AudioChunk,
+        _segments: mpsc::Sender<AudioSegment>,
+    ) -> anyhow::Result<()> {
         bail!("local node is not configured as a GPU audio processor")
     }
 }
@@ -219,16 +270,27 @@ pub struct NotReadyAudioProcessor;
 
 #[async_trait]
 impl MeshAudioProcessor for NotReadyAudioProcessor {
-    async fn process(&self, chunk: AudioChunk) -> anyhow::Result<AudioTaskResult> {
-        Ok(AudioTaskResult {
-            session_id: chunk.session_id,
-            sequence: chunk.sequence,
-            transcription: String::new(),
-            translation: "mesh GPU provider is running but audio pipeline is not wired yet".into(),
-            tts_sample_rate_hz: chunk.sample_rate_hz,
-            tts_output: Vec::new(),
-            meta: None,
-        })
+    async fn process_stream(
+        &self,
+        chunk: AudioChunk,
+        segments: mpsc::Sender<AudioSegment>,
+    ) -> anyhow::Result<()> {
+        let _ = segments
+            .send(AudioSegment {
+                session_id: chunk.session_id,
+                sequence: chunk.sequence,
+                clause_index: 0,
+                last: true,
+                transcription: String::new(),
+                translation: "mesh GPU provider is running but audio pipeline is not wired yet"
+                    .into(),
+                tts_sample_rate_hz: chunk.sample_rate_hz,
+                tts_output: Vec::new(),
+                meta: None,
+                auth_token: None,
+            })
+            .await;
+        Ok(())
     }
 }
 
@@ -254,8 +316,8 @@ struct AudioCodec;
 #[async_trait]
 impl request_response::Codec for AudioCodec {
     type Protocol = AudioProtocol;
-    type Request = AudioChunk;
-    type Response = AudioTaskResult;
+    type Request = AudioRequest;
+    type Response = AudioResponse;
 
     async fn read_request<T>(
         &mut self,
@@ -344,16 +406,34 @@ where
 pub struct LiveInterpreterMesh<T, P> {
     config: MeshConfig,
     telemetry: T,
-    processor: P,
+    processor: Arc<P>,
     providers: HashMap<PeerId, ProviderScore>,
-    pending: HashMap<request_response::OutboundRequestId, PendingAudioTask>,
+    /// Outstanding `Submit` requests awaiting an `Accepted` ack (for failover).
+    pending: HashMap<request_response::OutboundRequestId, PendingSubmit>,
+    /// Consumer side: per-(session, sequence) sink where inbound `Deliver`
+    /// clauses are forwarded so the caller plays them in order.
+    sessions: HashMap<(Uuid, u64), mpsc::Sender<AudioSegment>>,
+    /// Provider side: outstanding `Deliver` requests awaiting their `DeliverAck`,
+    /// so the synthesis task can serialize delivery (in-order clauses).
+    delivery_acks: HashMap<request_response::OutboundRequestId, oneshot::Sender<()>>,
 }
 
-struct PendingAudioTask {
+struct PendingSubmit {
     chunk: AudioChunk,
     attempted: Vec<PeerId>,
-    reply: oneshot::Sender<anyhow::Result<AudioTaskResult>>,
     sent_at: Instant,
+}
+
+/// Internal self-injected command: a provider's synthesis task asks the run loop
+/// (the only holder of the swarm) to deliver a finished clause to a consumer.
+/// `acked` fires once the consumer acks, so the task delivers clauses **in order**
+/// (request-response gives no cross-request ordering on its own).
+enum Internal {
+    Deliver {
+        peer: PeerId,
+        segment: AudioSegment,
+        acked: oneshot::Sender<()>,
+    },
 }
 
 impl<T, P> LiveInterpreterMesh<T, P>
@@ -365,9 +445,11 @@ where
         Self {
             config,
             telemetry,
-            processor,
+            processor: Arc::new(processor),
             providers: HashMap::new(),
             pending: HashMap::new(),
+            sessions: HashMap::new(),
+            delivery_acks: HashMap::new(),
         }
     }
 
@@ -388,6 +470,10 @@ where
         let mut health_tick = time::interval(self.config.health_interval);
         health_tick.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
+        // Provider synthesis tasks run off the loop and inject `Deliver`s here, the
+        // only place that owns the swarm.
+        let (internal_tx, mut internal_rx) = mpsc::channel::<Internal>(256);
+
         loop {
             select! {
                 _ = health_tick.tick() => {
@@ -401,8 +487,19 @@ where
                         return Ok(());
                     }
                 }
+                Some(internal) = internal_rx.recv() => {
+                    match internal {
+                        Internal::Deliver { peer, segment, acked } => {
+                            let request_id = swarm
+                                .behaviour_mut()
+                                .audio
+                                .send_request(&peer, AudioRequest::Deliver(segment));
+                            self.delivery_acks.insert(request_id, acked);
+                        }
+                    }
+                }
                 event = swarm.select_next_some() => {
-                    self.handle_swarm_event(event, &mut swarm).await?;
+                    self.handle_swarm_event(event, &mut swarm, &internal_tx).await?;
                 }
             }
         }
@@ -414,8 +511,8 @@ where
         swarm: &mut libp2p::Swarm<MeshBehaviour>,
     ) -> anyhow::Result<bool> {
         match command {
-            MeshCommand::SubmitAudio { chunk, reply } => {
-                self.submit_audio(chunk, reply, swarm);
+            MeshCommand::SubmitAudio { chunk, segments } => {
+                self.submit_audio(chunk, segments, swarm);
                 Ok(false)
             }
             MeshCommand::SetRole(role) => {
@@ -429,26 +526,28 @@ where
     fn submit_audio(
         &mut self,
         chunk: AudioChunk,
-        reply: oneshot::Sender<anyhow::Result<AudioTaskResult>>,
+        segments: mpsc::Sender<AudioSegment>,
         swarm: &mut libp2p::Swarm<MeshBehaviour>,
     ) {
+        // Register the sink first so inbound `Deliver` clauses have somewhere to go.
+        let key = (chunk.session_id, chunk.sequence);
+        self.sessions.insert(key, segments);
+
         let Some(peer_id) = self.best_provider(&[]) else {
-            let _ = reply.send(Err(anyhow::anyhow!(
-                "no GPU provider available in local mesh"
-            )));
+            // No provider → drop the sink so the caller's recv() ends (failure).
+            self.sessions.remove(&key);
             return;
         };
 
         let request_id = swarm
             .behaviour_mut()
             .audio
-            .send_request(&peer_id, chunk.clone());
+            .send_request(&peer_id, AudioRequest::Submit(chunk.clone()));
         self.pending.insert(
             request_id,
-            PendingAudioTask {
+            PendingSubmit {
                 chunk,
                 attempted: vec![peer_id],
-                reply,
                 sent_at: Instant::now(),
             },
         );
@@ -458,6 +557,7 @@ where
         &mut self,
         event: SwarmEvent<MeshBehaviourEvent>,
         swarm: &mut libp2p::Swarm<MeshBehaviour>,
+        internal_tx: &mpsc::Sender<Internal>,
     ) -> anyhow::Result<()> {
         match event {
             SwarmEvent::Behaviour(MeshBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
@@ -484,42 +584,141 @@ where
                 }
             }
             SwarmEvent::Behaviour(MeshBehaviourEvent::Audio(
-                request_response::Event::Message { message, .. },
+                request_response::Event::Message { message, peer, .. },
             )) => match message {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
-                    let authorized = token_matches(&self.config.auth_token, &request.auth_token);
-                    if self.config.local_role == MeshRole::GpuProvider && authorized {
-                        let result = self.processor.process(request).await?;
-                        let _ = swarm.behaviour_mut().audio.send_response(channel, result);
-                    }
-                    // Unauthorized or non-provider: drop silently → consumer times
-                    // out and fails over to another peer.
+                    let response = self.handle_audio_request(request, peer, internal_tx);
+                    let _ = swarm.behaviour_mut().audio.send_response(channel, response);
                 }
                 request_response::Message::Response {
                     request_id,
                     response,
-                } => {
-                    if let Some(pending) = self.pending.remove(&request_id) {
-                        if let Some(peer) = pending.attempted.last() {
-                            let elapsed = pending.sent_at.elapsed().as_millis() as u64;
-                            self.record_latency(*peer, elapsed);
-                        }
-                        let _ = pending.reply.send(Ok(response));
-                    }
-                }
+                } => self.handle_audio_response(request_id, response, swarm),
             },
             SwarmEvent::Behaviour(MeshBehaviourEvent::Audio(
                 request_response::Event::OutboundFailure {
                     request_id, error, ..
                 },
             )) => {
-                self.retry_or_fail(request_id, anyhow::anyhow!(error.to_string()), swarm);
+                // A failed `Deliver`: drop its ack so the synthesis task stops
+                // waiting and abandons the rest of the stream.
+                if self.delivery_acks.remove(&request_id).is_some() {
+                    tracing::warn!("mesh clause delivery failed: {error}");
+                } else {
+                    // Otherwise it was a `Submit` → fail over to the next provider.
+                    self.retry_or_fail(request_id, anyhow::anyhow!(error.to_string()), swarm);
+                }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Handle an inbound audio request and return the ack to send back.
+    ///
+    /// * `Submit` (provider role, authorized): ack `Accepted`, then spawn the
+    ///   streaming pipeline; each finished clause is injected back via `internal_tx`
+    ///   as a `Deliver` to the submitting `peer`.
+    /// * `Deliver` (consumer side): forward the clause to its session sink, ack
+    ///   `DeliverAck`. Unknown session is still acked (late/duplicate clause).
+    fn handle_audio_request(
+        &mut self,
+        request: AudioRequest,
+        peer: PeerId,
+        internal_tx: &mpsc::Sender<Internal>,
+    ) -> AudioResponse {
+        match request {
+            AudioRequest::Submit(chunk) => {
+                let authorized = token_matches(&self.config.auth_token, &chunk.auth_token);
+                if self.config.local_role != MeshRole::GpuProvider || !authorized {
+                    return AudioResponse::Rejected;
+                }
+                let processor = self.processor.clone();
+                let internal = internal_tx.clone();
+                let token = self.config.auth_token.clone();
+                tokio::spawn(async move {
+                    let (seg_tx, mut seg_rx) = mpsc::channel::<AudioSegment>(64);
+                    let synth =
+                        tokio::spawn(async move { processor.process_stream(chunk, seg_tx).await });
+                    // Deliver clauses one at a time, waiting for each ack before the
+                    // next, so they arrive at the consumer in order. Synthesis still
+                    // runs ahead (buffered in seg_rx), preserving the latency win.
+                    while let Some(mut segment) = seg_rx.recv().await {
+                        segment.auth_token = token.clone();
+                        let (ack_tx, ack_rx) = oneshot::channel();
+                        if internal
+                            .send(Internal::Deliver {
+                                peer,
+                                segment,
+                                acked: ack_tx,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break; // mesh loop gone
+                        }
+                        if ack_rx.await.is_err() {
+                            break; // delivery failed (consumer gone) → stop
+                        }
+                    }
+                    if let Ok(Err(error)) = synth.await {
+                        tracing::warn!("mesh process_stream failed: {error:#}");
+                    }
+                });
+                AudioResponse::Accepted
+            }
+            AudioRequest::Deliver(segment) => {
+                if !token_matches(&self.config.auth_token, &segment.auth_token) {
+                    return AudioResponse::Rejected;
+                }
+                let key = (segment.session_id, segment.sequence);
+                let last = segment.last;
+                if let Some(sink) = self.sessions.get(&key) {
+                    // try_send: never block the run loop on a slow consumer.
+                    let _ = sink.try_send(segment);
+                }
+                if last {
+                    self.sessions.remove(&key);
+                }
+                AudioResponse::DeliverAck
+            }
+        }
+    }
+
+    /// Handle an inbound audio response (an ack to one of our requests).
+    fn handle_audio_response(
+        &mut self,
+        request_id: request_response::OutboundRequestId,
+        response: AudioResponse,
+        swarm: &mut libp2p::Swarm<MeshBehaviour>,
+    ) {
+        match response {
+            // Our `Submit` was accepted: record routing latency; clauses now
+            // stream in as `Deliver` requests handled above.
+            AudioResponse::Accepted => {
+                if let Some(pending) = self.pending.remove(&request_id)
+                    && let Some(peer) = pending.attempted.last()
+                {
+                    self.record_latency(*peer, pending.sent_at.elapsed().as_millis() as u64);
+                }
+            }
+            // A provider rejected our `Submit` → fail over to the next provider.
+            AudioResponse::Rejected => {
+                self.retry_or_fail(
+                    request_id,
+                    anyhow::anyhow!("provider rejected the audio task"),
+                    swarm,
+                );
+            }
+            // Consumer acked one of our `Deliver`s: release the next clause.
+            AudioResponse::DeliverAck => {
+                if let Some(ack) = self.delivery_acks.remove(&request_id) {
+                    let _ = ack.send(());
+                }
+            }
+        }
     }
 
     async fn local_health(&self, peer_id: PeerId) -> anyhow::Result<MeshHealth> {
@@ -595,7 +794,7 @@ where
         swarm: &mut libp2p::Swarm<MeshBehaviour>,
     ) {
         let Some(mut pending) = self.pending.remove(&request_id) else {
-            return;
+            return; // not a Submit we're tracking (e.g. a Deliver failure) → ignore
         };
 
         if let Some(next_peer) = self.best_provider(&pending.attempted) {
@@ -604,12 +803,13 @@ where
             let next_request_id = swarm
                 .behaviour_mut()
                 .audio
-                .send_request(&next_peer, pending.chunk.clone());
+                .send_request(&next_peer, AudioRequest::Submit(pending.chunk.clone()));
             self.pending.insert(next_request_id, pending);
         } else {
-            let _ = pending
-                .reply
-                .send(Err(error.context("all GPU providers failed")));
+            // No provider left: drop the sink so the consumer's recv() ends.
+            self.sessions
+                .remove(&(pending.chunk.session_id, pending.chunk.sequence));
+            tracing::warn!("{:#}", error.context("all GPU providers failed"));
         }
     }
 
@@ -908,6 +1108,54 @@ mod tests {
         let decoded: AudioChunk = bincode::deserialize(&bytes).unwrap();
 
         assert_eq!(decoded, chunk);
+    }
+
+    #[test]
+    fn bincode_roundtrip_keeps_audio_request_variants() {
+        let segment = AudioSegment {
+            session_id: Uuid::new_v4(),
+            sequence: 3,
+            clause_index: 1,
+            last: true,
+            transcription: "hola mundo".into(),
+            translation: "world".into(),
+            tts_sample_rate_hz: 24_000,
+            tts_output: vec![0.1, -0.2, 0.3],
+            meta: None,
+            auth_token: Some("secret".into()),
+        };
+        // Provider → consumer: a delivered clause.
+        let deliver = AudioRequest::Deliver(segment.clone());
+        let decoded: AudioRequest =
+            bincode::deserialize(&bincode::serialize(&deliver).unwrap()).unwrap();
+        assert_eq!(decoded, deliver);
+
+        // Consumer → provider: a submit.
+        let submit = AudioRequest::Submit(AudioChunk {
+            session_id: segment.session_id,
+            sequence: 0,
+            sample_rate_hz: 16_000,
+            direction: Direction::EsToEn,
+            samples: vec![0.0; 4],
+            voice_ref: None,
+            auth_token: None,
+        });
+        let decoded: AudioRequest =
+            bincode::deserialize(&bincode::serialize(&submit).unwrap()).unwrap();
+        assert_eq!(decoded, submit);
+    }
+
+    #[test]
+    fn bincode_roundtrip_keeps_audio_response_acks() {
+        for response in [
+            AudioResponse::Accepted,
+            AudioResponse::DeliverAck,
+            AudioResponse::Rejected,
+        ] {
+            let decoded: AudioResponse =
+                bincode::deserialize(&bincode::serialize(&response).unwrap()).unwrap();
+            assert_eq!(decoded, response);
+        }
     }
 
     #[test]

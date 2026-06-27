@@ -1,16 +1,16 @@
 //! Bridge between the libp2p mesh (`mesh.rs`) and the interpretation pipeline
 //! (`pipeline.rs`).
 //!
-//! A GPU **provider** node receives an [`AudioChunk`](crate::mesh::AudioChunk)
-//! (raw `f32` samples) from a **consumer**, runs the full
-//! transcribe → translate → synthesize pipeline, and returns an
-//! [`AudioTaskResult`](crate::mesh::AudioTaskResult) carrying the translated
-//! voice as `f32` PCM. The consumer plays that into its virtual mic — so the
-//! *translated voice travels to another node* and back (R10).
+//! A GPU **provider** node receives an [`AudioChunk`] (raw `f32` samples) from a
+//! **consumer**, runs the full transcribe → translate → synthesize pipeline, and
+//! streams the translated voice back **clause-by-clause** as [`AudioSegment`]s
+//! (`f32` PCM). The consumer plays each into its virtual mic as it arrives — so
+//! the *translated voice travels to another node* and back (R10), and clause 1
+//! plays while clause 2 is still being synthesized (R11.6).
 //!
 //! Kept separate from both `mesh.rs` (pure libp2p) and `pipeline.rs` (pure
 //! orchestration) for SRP. The PCM conversions and event→result projection are
-//! pure and unit-tested; only `process` does I/O.
+//! pure and unit-tested; only `process_stream` does I/O.
 //!
 //! Cross-node cloning: when a chunk carries a [`VoiceReference`] the provider
 //! builds a consent-gated profile and caches it per `session_id`, so the
@@ -18,19 +18,20 @@
 //! later (reference-less) chunks reuse the cache. Without a reference it falls
 //! back to the provider's configured profile/identity (neutral by default).
 
-use crate::mesh::{AudioChunk, AudioTaskResult, MeshAudioProcessor, VoiceReference};
-use crate::pipeline::{TextTranslator, Transcriber, interpret_utterance};
-use crate::types::{Lane, Lang, PipelineEvent};
-use crate::virtual_mic::MockAudioOutput;
+use crate::mesh::{AudioChunk, AudioSegment, MeshAudioProcessor, VoiceReference};
+use crate::pipeline::{TextTranslator, Transcriber, split_clauses};
+use crate::types::{Direction, Lane, Lang, PipelineEvent};
 use crate::voice::{
     GeneratedAudioMeta, VoiceIdentity, VoiceProfile, VoiceRoute, VoiceSample,
-    VoiceSynthesisBackend, route_for_lane,
+    VoiceSynthesisBackend, VoiceSynthesisRequest, route_for_lane,
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 /// Decode interleaved s16le bytes into normalized `f32` samples.
@@ -191,7 +192,15 @@ impl PipelineMeshProcessor {
 
 #[async_trait]
 impl MeshAudioProcessor for PipelineMeshProcessor {
-    async fn process(&self, chunk: AudioChunk) -> Result<AudioTaskResult> {
+    /// Stream the interpretation clause-by-clause: ASR + translate once, then
+    /// synthesize each clause and emit it as soon as it's ready, so the consumer
+    /// plays clause 1 while clause 2 is still being synthesized (R11.6 over the
+    /// mesh). The first clause carries the full transcription.
+    async fn process_stream(
+        &self,
+        chunk: AudioChunk,
+        segments: mpsc::Sender<AudioSegment>,
+    ) -> Result<()> {
         let (profile, identity) = self.resolve_voice(&chunk)?;
 
         std::fs::create_dir_all(&self.uploads_dir).ok();
@@ -200,45 +209,92 @@ impl MeshAudioProcessor for PipelineMeshProcessor {
             .join(format!("mesh-{}-{}.wav", chunk.session_id, chunk.sequence));
         crate::capture::write_wav_16le(&wav, &chunk.samples, chunk.sample_rate_hz)?;
 
-        // The provider produces audio for the remote consumer; the synthesized
-        // PCM is read back from the events, so a no-op sink is fine here.
-        let sink = MockAudioOutput::default();
-        let result = interpret_utterance(
-            &*self.asr,
-            &*self.translator,
-            &*self.voice,
-            &sink,
-            &profile,
-            &wav,
-            chunk.direction,
-            identity,
-            Lane::Local,
-            Uuid::new_v4(),
-            0,
-        )
-        .await;
+        let transcription = self
+            .asr
+            .transcribe(&wav, chunk.direction.source_lang())
+            .await;
         let _ = std::fs::remove_file(&wav);
-        let events = result?;
+        let transcription = transcription?;
+        let translation = self
+            .translator
+            .translate(&transcription, &chunk.direction)
+            .await?;
 
-        let parts = collect_interpreted(&events, chunk.sample_rate_hz);
-
-        // R11.4: stamp provenance on the synthesized audio. None when nothing was
-        // rendered (route Off / text-only). `Neutral` drops the profile id inside
-        // GeneratedAudioMeta::new, so a monitor voice isn't tagged as a timbre.
         let route = route_for_lane(identity, Lane::Local);
-        let meta = (route != VoiceRoute::Off && !parts.tts_pcm.is_empty()).then(|| {
-            GeneratedAudioMeta::new("li-mesh-provider", route, Some(profile.id), now_unix_ms())
-        });
+        let target_lang = match chunk.direction {
+            Direction::EsToEn => Lang::En,
+            Direction::EnToEs => Lang::Es,
+        };
+        let clauses: Vec<String> = if route == VoiceRoute::Off {
+            Vec::new()
+        } else {
+            split_clauses(&translation)
+                .into_iter()
+                .filter(|clause| !clause.trim().is_empty())
+                .collect()
+        };
 
-        Ok(AudioTaskResult {
-            session_id: chunk.session_id,
-            sequence: chunk.sequence,
-            transcription: parts.transcription,
-            translation: parts.translation,
-            tts_sample_rate_hz: parts.tts_sample_rate_hz,
-            tts_output: pcm_s16le_to_f32(&parts.tts_pcm),
-            meta,
-        })
+        // No audio to render (Off / empty): emit a single text-only final segment.
+        if clauses.is_empty() {
+            let _ = segments
+                .send(AudioSegment {
+                    session_id: chunk.session_id,
+                    sequence: chunk.sequence,
+                    clause_index: 0,
+                    last: true,
+                    transcription,
+                    translation,
+                    tts_sample_rate_hz: chunk.sample_rate_hz,
+                    tts_output: Vec::new(),
+                    meta: None,
+                    auth_token: None,
+                })
+                .await;
+            return Ok(());
+        }
+
+        let total = clauses.len();
+        for (index, clause) in clauses.iter().enumerate() {
+            let request = VoiceSynthesisRequest {
+                text: clause.clone(),
+                lang: target_lang,
+                profile: profile.clone(),
+                neutral: route == VoiceRoute::Neutral,
+            };
+            let mut stream = self.voice.synthesize_stream(request).await?;
+            let mut pcm = Vec::new();
+            let mut tts_sample_rate_hz = chunk.sample_rate_hz;
+            while let Some(frame) = stream.next().await {
+                let frame = frame?;
+                tts_sample_rate_hz = frame.spec.sample_rate;
+                pcm.extend_from_slice(&frame.pcm);
+            }
+
+            // R11.4 provenance per clause; `Neutral` drops the profile id inside.
+            let meta = (!pcm.is_empty()).then(|| {
+                GeneratedAudioMeta::new("li-mesh-provider", route, Some(profile.id), now_unix_ms())
+            });
+            let segment = AudioSegment {
+                session_id: chunk.session_id,
+                sequence: chunk.sequence,
+                clause_index: index as u32,
+                last: index + 1 == total,
+                transcription: if index == 0 {
+                    transcription.clone()
+                } else {
+                    String::new()
+                },
+                translation: clause.clone(),
+                tts_sample_rate_hz,
+                tts_output: pcm_s16le_to_f32(&pcm),
+                meta,
+                auth_token: None, // the mesh layer stamps the token before delivery
+            };
+            if segments.send(segment).await.is_err() {
+                break; // consumer gone
+            }
+        }
+        Ok(())
     }
 }
 
@@ -378,18 +434,129 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn processor_runs_pipeline_and_returns_translated_audio() {
-        let result = processor()
-            .process(chunk(Uuid::new_v4(), 7, None))
+    /// Drain a full streamed interpretation into an ordered Vec of segments.
+    async fn collect(processor: &PipelineMeshProcessor, chunk: AudioChunk) -> Vec<AudioSegment> {
+        let (tx, mut rx) = mpsc::channel(64);
+        processor
+            .process_stream(chunk, tx)
             .await
-            .expect("process ok");
-        assert_eq!(result.sequence, 7);
-        assert_eq!(result.transcription, "hola mundo");
-        assert_eq!(result.translation, "hello world");
-        assert_eq!(result.tts_sample_rate_hz, 24_000);
-        // MockVoiceBackend emits 1 s16le sample per character of "hello world".
-        assert!(!result.tts_output.is_empty());
+            .expect("process_stream ok");
+        let mut segments = Vec::new();
+        while let Some(segment) = rx.recv().await {
+            segments.push(segment);
+        }
+        segments
+    }
+
+    #[tokio::test]
+    async fn processor_runs_pipeline_and_streams_translated_audio() {
+        // "hello world" has no terminator → a single clause → one final segment.
+        let segments = collect(&processor(), chunk(Uuid::new_v4(), 7, None)).await;
+        assert_eq!(segments.len(), 1);
+        let segment = &segments[0];
+        assert_eq!(segment.sequence, 7);
+        assert_eq!(segment.clause_index, 0);
+        assert!(segment.last);
+        assert_eq!(segment.transcription, "hola mundo");
+        assert_eq!(segment.translation, "hello world");
+        assert_eq!(segment.tts_sample_rate_hz, 24_000);
+        assert!(!segment.tts_output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multi_clause_translation_streams_ordered_segments() {
+        // Two clauses → two segments, in order; only clause 0 carries transcription.
+        let processor = PipelineMeshProcessor::new(
+            Arc::new(MockAsr("hola. mundo.")),
+            Arc::new(MockTranslator("uno. dos.")),
+            Arc::new(MockVoiceBackend::default()),
+            neutral_profile(),
+            VoiceIdentity::Neutral,
+            std::env::temp_dir().join("li-mesh-test-uploads"),
+            std::env::temp_dir().join("li-mesh-test-voice"),
+        );
+        let segments = collect(&processor, chunk(Uuid::new_v4(), 0, None)).await;
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].clause_index, 0);
+        assert_eq!(segments[0].translation, "uno.");
+        assert_eq!(segments[0].transcription, "hola. mundo.");
+        assert!(!segments[0].last);
+        assert_eq!(segments[1].clause_index, 1);
+        assert_eq!(segments[1].translation, "dos.");
+        assert_eq!(segments[1].transcription, ""); // transcription only on clause 0
+        assert!(segments[1].last);
+    }
+
+    #[tokio::test]
+    async fn clauses_stream_incrementally_not_after_full_synthesis() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+        use tokio::time::{Duration, timeout};
+
+        // A voice backend whose SECOND+ clause blocks until the test releases a
+        // gate. If the provider emitted clause 0 *before* synthesizing clause 1,
+        // we receive segment 0 while clause 1 is still gated — proving streaming.
+        struct GatedVoice {
+            gate: Arc<Notify>,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl VoiceSynthesisBackend for GatedVoice {
+            async fn synthesize_stream(
+                &self,
+                req: VoiceSynthesisRequest,
+            ) -> Result<crate::voice::AudioFrameStream> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) >= 1 {
+                    self.gate.notified().await; // 2nd+ clause waits for the test
+                }
+                let frame = crate::voice::AudioFrame {
+                    spec: crate::types::AudioSpec::mono_s16le(24_000),
+                    pcm: vec![0u8; req.text.len().max(1) * 2],
+                };
+                Ok(Box::pin(futures_util::stream::once(
+                    async move { Ok(frame) },
+                )))
+            }
+        }
+
+        let gate = Arc::new(Notify::new());
+        let processor = PipelineMeshProcessor::new(
+            Arc::new(MockAsr("hola")),
+            Arc::new(MockTranslator("uno. dos.")),
+            Arc::new(GatedVoice {
+                gate: gate.clone(),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            neutral_profile(),
+            VoiceIdentity::Neutral,
+            std::env::temp_dir().join("li-mesh-test-uploads"),
+            std::env::temp_dir().join("li-mesh-test-voice"),
+        );
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            processor
+                .process_stream(chunk(Uuid::new_v4(), 0, None), tx)
+                .await
+        });
+
+        // Clause 0 must arrive while clause 1 synthesis is still gated.
+        let first = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("clause 0 should arrive before clause 1 is synthesized")
+            .expect("a segment");
+        assert_eq!(first.clause_index, 0);
+        assert!(!first.last);
+
+        gate.notify_one(); // release clause 1 synthesis
+        let second = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("clause 1 arrives after release")
+            .expect("a segment");
+        assert_eq!(second.clause_index, 1);
+        assert!(second.last);
+
+        task.await.expect("join").expect("process_stream ok");
     }
 
     #[test]
@@ -427,10 +594,7 @@ mod tests {
             consent_confirmed: true,
         };
         // First chunk carries the reference → session cached as MyProfile/clone.
-        processor
-            .process(chunk(session, 0, Some(reference)))
-            .await
-            .expect("seq0 ok");
+        collect(&processor, chunk(session, 0, Some(reference))).await;
         let (_, identity) = processor.resolve_voice(&chunk(session, 1, None)).unwrap();
         assert_eq!(
             identity,

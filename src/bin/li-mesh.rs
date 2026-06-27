@@ -44,7 +44,7 @@ use live_interpreter::voice::{
     AudioFrame, HttpQwenBackend, VoiceIdentity, VoiceProfile, VoiceRoute, VoiceSample,
     VoiceSynthesisBackend, VoiceSynthesisRequest, VoiceUsagePolicy, route_for_lane,
 };
-use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 #[tokio::main]
@@ -160,11 +160,13 @@ async fn run_consumer() -> Result<()> {
             voice_ref: if seq == 0 { voice_ref.clone() } else { None },
             auth_token: token.clone(),
         };
-        let (reply_tx, reply_rx) = oneshot::channel();
+        // Stream clauses back: the provider delivers each as it finishes, so the
+        // first clause plays into the mic while later ones are still synthesizing.
+        let (seg_tx, mut seg_rx) = mpsc::channel(64);
         if commands
             .send(MeshCommand::SubmitAudio {
                 chunk,
-                reply: reply_tx,
+                segments: seg_tx,
             })
             .await
             .is_err()
@@ -172,22 +174,39 @@ async fn run_consumer() -> Result<()> {
             tracing::error!("mesh task loop is gone; stopping");
             break;
         }
-        match reply_rx.await {
-            Ok(Ok(result)) => {
-                tracing::info!("· src: {}", result.transcription);
-                tracing::info!("· dst: {}", result.translation);
-                let frame = AudioFrame {
-                    spec: AudioSpec::mono_s16le(result.tts_sample_rate_hz),
-                    pcm: f32_to_pcm_s16le(&result.tts_output),
-                };
-                if let Err(error) = mic.submit(&frame) {
-                    tracing::error!("virtual mic submit failed: {error:#}");
-                } else {
-                    tracing::info!("→ translated voice to virtual mic");
+        let mut got_any = false;
+        loop {
+            // A clause may take seconds (TTS); bound the wait so a dead provider
+            // doesn't stall the next utterance forever.
+            match tokio::time::timeout(Duration::from_secs(30), seg_rx.recv()).await {
+                Ok(Some(segment)) => {
+                    got_any = true;
+                    if !segment.transcription.is_empty() {
+                        tracing::info!("· src: {}", segment.transcription);
+                    }
+                    tracing::info!("· dst[{}]: {}", segment.clause_index, segment.translation);
+                    if !segment.tts_output.is_empty() {
+                        let frame = AudioFrame {
+                            spec: AudioSpec::mono_s16le(segment.tts_sample_rate_hz),
+                            pcm: f32_to_pcm_s16le(&segment.tts_output),
+                        };
+                        if let Err(error) = mic.submit(&frame) {
+                            tracing::error!("virtual mic submit failed: {error:#}");
+                        }
+                    }
+                    if segment.last {
+                        break;
+                    }
+                }
+                Ok(None) => break, // channel closed: done, or routing gave up
+                Err(_) => {
+                    tracing::warn!("timed out waiting for a clause; abandoning this utterance");
+                    break;
                 }
             }
-            Ok(Err(error)) => tracing::warn!("mesh task failed: {error:#}"),
-            Err(_) => tracing::warn!("mesh task dropped without a reply"),
+        }
+        if !got_any {
+            tracing::warn!("no provider answered (is one running on the LAN?)");
         }
     }
     Ok(())
