@@ -52,45 +52,45 @@ struct ClientConfig {
 
 impl ClientConfig {
     fn from_env() -> anyhow::Result<Self> {
-        let server_url = env::var("OVT_SERVER_URL")
+        let server_url = env::var("LI_SERVER_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8787".into())
             .trim_end_matches('/')
             .to_string();
-        let bind = env::var("OVT_CLIENT_BIND")
+        let bind = env::var("LI_CLIENT_BIND")
             .unwrap_or_else(|_| "127.0.0.1:8790".into())
             .parse()?;
-        let direction = env::var("OVT_CLIENT_DIRECTION").unwrap_or_else(|_| "es_to_en".into());
+        let direction = env::var("LI_CLIENT_DIRECTION").unwrap_or_else(|_| "es_to_en".into());
         let data_dir =
-            PathBuf::from(env::var("OVT_CLIENT_DATA_DIR").unwrap_or_else(|_| "data/client".into()));
-        let play_cmd = env::var("OVT_CLIENT_PLAY_CMD").unwrap_or_else(|_| "pw-play".into());
-        let play_target = env::var("OVT_CLIENT_PLAY_TARGET")
+            PathBuf::from(env::var("LI_CLIENT_DATA_DIR").unwrap_or_else(|_| "data/client".into()));
+        let play_cmd = env::var("LI_CLIENT_PLAY_CMD").unwrap_or_else(|_| "pw-play".into());
+        let play_target = env::var("LI_CLIENT_PLAY_TARGET")
             .ok()
-            .or_else(|| Some("ovt-teams-mic-sink".into()));
-        let auth_token = env::var("OVT_CLIENT_AUTH_TOKEN")
+            .or_else(|| Some("live-interpreter-mic-sink".into()));
+        let auth_token = env::var("LI_CLIENT_AUTH_TOKEN")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .or_else(|| {
-                env::var("OVT_AUTH_TOKEN")
+                env::var("LI_AUTH_TOKEN")
                     .ok()
                     .filter(|value| !value.trim().is_empty())
             });
-        let vad_threshold = env::var("OVT_CLIENT_VAD_THRESHOLD")
+        let vad_threshold = env::var("LI_CLIENT_VAD_THRESHOLD")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(0.012);
-        let silence_ms = env::var("OVT_CLIENT_SILENCE_MS")
+        let silence_ms = env::var("LI_CLIENT_SILENCE_MS")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(800);
-        let min_voice_ms = env::var("OVT_CLIENT_MIN_VOICE_MS")
+        let min_voice_ms = env::var("LI_CLIENT_MIN_VOICE_MS")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(280);
-        let max_utterance_ms = env::var("OVT_CLIENT_MAX_UTTERANCE_MS")
+        let max_utterance_ms = env::var("LI_CLIENT_MAX_UTTERANCE_MS")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(8500);
-        let pre_roll_ms = env::var("OVT_CLIENT_PRE_ROLL_MS")
+        let pre_roll_ms = env::var("LI_CLIENT_PRE_ROLL_MS")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(240);
@@ -232,7 +232,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/swap-direction", post(swap_direction))
         .with_state(app.clone());
 
-    tracing::info!("OVT meeting client UI: http://{}", app.config.bind);
+    tracing::info!("Live Interpreter client UI: http://{}", app.config.bind);
     let listener = tokio::net::TcpListener::bind(app.config.bind).await?;
     axum::serve(listener, router).await?;
     app.controls.stop.store(true, Ordering::Relaxed);
@@ -661,7 +661,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>OVT Meeting Client</title>
+  <title>Live Interpreter Client</title>
   <style>
     :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; background:#101214; color:#eef1f4; }
     body { margin:0; }
@@ -686,7 +686,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 <body>
 <main>
   <header>
-    <h1>OVT Meeting Client</h1>
+    <h1>Live Interpreter Client</h1>
     <div class="status" id="server"></div>
   </header>
   <div class="bar">

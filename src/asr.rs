@@ -21,7 +21,7 @@ impl AsrEngine {
     pub fn load(config: &Config) -> anyhow::Result<Self> {
         if !config.whisper_model.exists() {
             bail!(
-                "Whisper model not found at {}. Download a whisper.cpp ggml model or set OVT_WHISPER_MODEL.",
+                "Whisper model not found at {}. Download a whisper.cpp ggml model or set LI_WHISPER_MODEL.",
                 config.whisper_model.display()
             );
         }

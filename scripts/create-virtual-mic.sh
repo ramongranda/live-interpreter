@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NAME="${OVT_VIRTUAL_NAME:-ovt-teams-mic}"
-LATENCY="${OVT_VIRTUAL_LATENCY:-30ms}"
+NAME="${LI_VIRTUAL_NAME:-live-interpreter-mic}"
+LATENCY="${LI_VIRTUAL_LATENCY:-30ms}"
 
 if pgrep -af "pw-loopback.*${NAME}" >/dev/null; then
-  echo "Virtual Teams mic already running: ${NAME}"
+  echo "Virtual microphone already running: ${NAME}"
   exit 0
 fi
 
-echo "Creating virtual Teams microphone with PipeWire: ${NAME}"
-echo "In Teams, select microphone/source: ${NAME}-source"
+echo "Creating virtual microphone with PipeWire: ${NAME}"
+echo "In your meeting/voice app, select microphone/source: ${NAME}-source"
 echo "Send generated audio to sink: ${NAME}-sink"
 
 exec pw-loopback \

@@ -2,9 +2,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-INSTALL_DIR="${OVT_QWEN_INSTALL_DIR:-${ROOT}/vendor/qwen3_tts_rs}"
-ASSET_NAME="${OVT_QWEN_ASSET:-qwen3-tts-linux-x86_64-cuda}"
-MODEL_SIZE="${OVT_QWEN_MODEL_SIZE:-0.6B}"
+INSTALL_DIR="${LI_QWEN_INSTALL_DIR:-${ROOT}/vendor/qwen3_tts_rs}"
+ASSET_NAME="${LI_QWEN_ASSET:-qwen3-tts-linux-x86_64-cuda}"
+MODEL_SIZE="${LI_QWEN_MODEL_SIZE:-0.6B}"
 
 case "${MODEL_SIZE}" in
   0.6B)
@@ -14,7 +14,7 @@ case "${MODEL_SIZE}" in
     CUSTOM_VOICE_MODEL="Qwen3-TTS-12Hz-1.7B-CustomVoice"
     ;;
   *)
-    echo "OVT_QWEN_MODEL_SIZE must be 0.6B or 1.7B" >&2
+    echo "LI_QWEN_MODEL_SIZE must be 0.6B or 1.7B" >&2
     exit 2
     ;;
 esac

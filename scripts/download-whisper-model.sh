@@ -2,7 +2,7 @@
 set -euo pipefail
 
 MODEL="${1:-large-v3-turbo}"
-OUT_DIR="${OVT_MODEL_DIR:-data/models}"
+OUT_DIR="${LI_MODEL_DIR:-data/models}"
 mkdir -p "${OUT_DIR}"
 
 case "${MODEL}" in

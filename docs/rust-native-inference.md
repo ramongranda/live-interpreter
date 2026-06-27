@@ -7,7 +7,7 @@ Rust axum server
   -> whisper-rs / whisper.cpp for ASR
   -> Ollama translator model for text translation
   -> qwen3_tts_rs API server for TTS
-  -> PipeWire virtual microphone for Teams
+  -> PipeWire virtual microphone for meeting and voice apps
 ```
 
 The target architecture is more native:

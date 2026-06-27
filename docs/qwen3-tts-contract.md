@@ -1,6 +1,6 @@
 # Qwen3-TTS HTTP contract
 
-The Rust server expects a local Qwen3-TTS service at `OVT_QWEN_TTS_URL`.
+The Rust server expects a local Qwen3-TTS service at `LI_QWEN_TTS_URL`.
 
 Request:
 

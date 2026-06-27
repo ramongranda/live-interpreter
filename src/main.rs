@@ -1,17 +1,7 @@
-mod asr;
-mod config;
 mod routes;
-mod translate;
-mod tts;
-mod types;
 
-use crate::{
-    asr::AsrEngine,
-    config::Config,
-    routes::{AppState, app},
-    translate::Translator,
-    tts::TtsEngine,
-};
+use crate::routes::{AppState, app};
+use live_interpreter::{asr::AsrEngine, config::Config, translate::Translator, tts::TtsEngine};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
@@ -27,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&config.data_dir).await?;
 
     let asr = Arc::new(AsrEngine::load(&config)?);
-    let translator = Translator::new(config.ollama_url.clone(), config.ollama_model.clone());
+    let translator = Translator::from_env(config.ollama_url.clone(), config.ollama_model.clone())?;
     let tts = TtsEngine::new(&config).await?;
 
     let state = AppState {

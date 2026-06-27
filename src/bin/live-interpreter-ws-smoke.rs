@@ -12,13 +12,13 @@ struct StreamStart<'a> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let server_url = env::var("OVT_SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:8787".into());
+    let server_url = env::var("LI_SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:8787".into());
     let audio_path = env::args()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/ovt-gpu-tts.wav"));
-    let direction = env::var("OVT_CLIENT_DIRECTION").unwrap_or_else(|_| "en_to_es".into());
-    let token = env::var("OVT_AUTH_TOKEN").ok();
+        .unwrap_or_else(|| PathBuf::from("/tmp/live-interpreter-gpu-tts.wav"));
+    let direction = env::var("LI_CLIENT_DIRECTION").unwrap_or_else(|_| "en_to_es".into());
+    let token = env::var("LI_AUTH_TOKEN").ok();
     let url = websocket_url(&server_url, token.as_deref());
     let audio = tokio::fs::read(&audio_path)
         .await
