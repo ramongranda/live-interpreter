@@ -6,6 +6,7 @@ pub mod events;
 pub mod mesh;
 pub mod mesh_pipeline;
 pub mod pipeline;
+pub mod quality;
 pub mod runtime;
 pub mod translate;
 pub mod tts;

@@ -90,6 +90,104 @@ pub fn route_for_lane(identity: VoiceIdentity, lane: Lane) -> VoiceRoute {
     }
 }
 
+/// R11.2 — privacy policy governing how a voice profile may be used, especially
+/// over the mesh. Default = the shipped behavior (cross-node cloning allowed,
+/// consent required, output watermarked). Flip `allow_remote_synthesis` off to
+/// keep the timbre on this box (remote then renders neutral).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VoiceUsagePolicy {
+    /// Hard gate: never synthesize a user's timbre without confirmed consent.
+    pub require_consent: bool,
+    /// May the voice reference travel to a remote provider for cross-node
+    /// cloning? `false` = the reference never leaves this node.
+    pub allow_remote_synthesis: bool,
+    /// May the raw profile/embedding be exported off the device?
+    pub allow_profile_export: bool,
+    /// Stamp synthesized audio with provenance metadata ([`GeneratedAudioMeta`]).
+    pub watermark: bool,
+}
+
+impl Default for VoiceUsagePolicy {
+    fn default() -> Self {
+        Self {
+            require_consent: true,
+            allow_remote_synthesis: true,
+            allow_profile_export: false,
+            watermark: true,
+        }
+    }
+}
+
+impl VoiceUsagePolicy {
+    /// Read overrides from env (`LI_VOICE_REQUIRE_CONSENT`, `LI_VOICE_ALLOW_REMOTE`,
+    /// `LI_VOICE_ALLOW_EXPORT`, `LI_VOICE_WATERMARK`). Unset = default; `0`/`false`/
+    /// `no`/`off` disables, any other value enables.
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        Self {
+            require_consent: env_flag("LI_VOICE_REQUIRE_CONSENT", d.require_consent),
+            allow_remote_synthesis: env_flag("LI_VOICE_ALLOW_REMOTE", d.allow_remote_synthesis),
+            allow_profile_export: env_flag("LI_VOICE_ALLOW_EXPORT", d.allow_profile_export),
+            watermark: env_flag("LI_VOICE_WATERMARK", d.watermark),
+        }
+    }
+
+    /// Whether the consumer may attach its voice reference to a mesh chunk. Pure:
+    /// remote synthesis must be allowed and (if required) consent confirmed.
+    pub fn may_ship_reference(&self, consent_confirmed: bool) -> bool {
+        self.allow_remote_synthesis && (!self.require_consent || consent_confirmed)
+    }
+}
+
+/// Parse a boolean env flag: `0`/`false`/`no`/`off`/empty = false, any other set
+/// value = true, unset = `default`.
+fn env_flag(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off" | ""
+        ),
+        Err(_) => default,
+    }
+}
+
+/// R11.4 — provenance stamped on synthesized audio: traceable *within the system*
+/// that an utterance was machine-generated and from which profile. Not audible;
+/// it serves auditability and the consent ethic. The clock is injected so the
+/// builder stays pure/testable.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeneratedAudioMeta {
+    /// Component or node that produced the audio (e.g. a peer id, "li-mesh").
+    pub generated_by: String,
+    /// The cloned profile's id; `None` for the neutral voice (no timbre).
+    pub voice_profile_id: Option<Uuid>,
+    /// Always true for our output (we never emit "real" audio).
+    pub synthetic: bool,
+    pub timestamp_ms: u64,
+}
+
+impl GeneratedAudioMeta {
+    /// Build provenance for a rendered frame. `profile_id` is only retained when
+    /// the route actually clones a timbre; the neutral voice carries `None`.
+    pub fn new(
+        generated_by: impl Into<String>,
+        route: VoiceRoute,
+        profile_id: Option<Uuid>,
+        timestamp_ms: u64,
+    ) -> Self {
+        Self {
+            generated_by: generated_by.into(),
+            voice_profile_id: if route == VoiceRoute::Clone {
+                profile_id
+            } else {
+                None
+            },
+            synthetic: true,
+            timestamp_ms,
+        }
+    }
+}
+
 /// What the pipeline asks a backend to render.
 #[derive(Clone, Debug)]
 pub struct VoiceSynthesisRequest {
@@ -293,6 +391,47 @@ mod tests {
         assert!(profile(true, vec![sample()]).is_usable());
         assert!(!profile(false, vec![sample()]).is_usable()); // no consent
         assert!(!profile(true, vec![]).is_usable()); // no samples
+    }
+
+    #[test]
+    fn default_policy_matches_shipped_behavior() {
+        let p = VoiceUsagePolicy::default();
+        assert!(p.require_consent);
+        assert!(p.allow_remote_synthesis); // cross-node cloning stays on by default
+        assert!(!p.allow_profile_export);
+        assert!(p.watermark);
+    }
+
+    #[test]
+    fn may_ship_reference_gates_on_remote_and_consent() {
+        let open = VoiceUsagePolicy::default();
+        assert!(open.may_ship_reference(true));
+        assert!(!open.may_ship_reference(false)); // consent required
+
+        let local_only = VoiceUsagePolicy {
+            allow_remote_synthesis: false,
+            ..VoiceUsagePolicy::default()
+        };
+        assert!(!local_only.may_ship_reference(true)); // timbre never leaves the box
+
+        let no_consent_gate = VoiceUsagePolicy {
+            require_consent: false,
+            ..VoiceUsagePolicy::default()
+        };
+        assert!(no_consent_gate.may_ship_reference(false)); // consent not enforced
+    }
+
+    #[test]
+    fn generated_meta_keeps_profile_only_when_cloning() {
+        let id = Uuid::from_u128(7);
+        let clone = GeneratedAudioMeta::new("li-mesh", VoiceRoute::Clone, Some(id), 1_234);
+        assert_eq!(clone.voice_profile_id, Some(id));
+        assert!(clone.synthetic);
+        assert_eq!(clone.timestamp_ms, 1_234);
+
+        let neutral = GeneratedAudioMeta::new("li-mesh", VoiceRoute::Neutral, Some(id), 1_234);
+        assert_eq!(neutral.voice_profile_id, None); // neutral voice carries no timbre id
+        assert!(neutral.synthetic);
     }
 
     #[tokio::test]

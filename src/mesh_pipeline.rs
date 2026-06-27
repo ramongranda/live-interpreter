@@ -22,7 +22,10 @@ use crate::mesh::{AudioChunk, AudioTaskResult, MeshAudioProcessor, VoiceReferenc
 use crate::pipeline::{TextTranslator, Transcriber, interpret_utterance};
 use crate::types::{Lane, Lang, PipelineEvent};
 use crate::virtual_mic::MockAudioOutput;
-use crate::voice::{VoiceIdentity, VoiceProfile, VoiceSample, VoiceSynthesisBackend};
+use crate::voice::{
+    GeneratedAudioMeta, VoiceIdentity, VoiceProfile, VoiceRoute, VoiceSample,
+    VoiceSynthesisBackend, route_for_lane,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -218,6 +221,15 @@ impl MeshAudioProcessor for PipelineMeshProcessor {
         let events = result?;
 
         let parts = collect_interpreted(&events, chunk.sample_rate_hz);
+
+        // R11.4: stamp provenance on the synthesized audio. None when nothing was
+        // rendered (route Off / text-only). `Neutral` drops the profile id inside
+        // GeneratedAudioMeta::new, so a monitor voice isn't tagged as a timbre.
+        let route = route_for_lane(identity, Lane::Local);
+        let meta = (route != VoiceRoute::Off && !parts.tts_pcm.is_empty()).then(|| {
+            GeneratedAudioMeta::new("li-mesh-provider", route, Some(profile.id), now_unix_ms())
+        });
+
         Ok(AudioTaskResult {
             session_id: chunk.session_id,
             sequence: chunk.sequence,
@@ -225,8 +237,19 @@ impl MeshAudioProcessor for PipelineMeshProcessor {
             translation: parts.translation,
             tts_sample_rate_hz: parts.tts_sample_rate_hz,
             tts_output: pcm_s16le_to_f32(&parts.tts_pcm),
+            meta,
         })
     }
+}
+
+/// Wall-clock ms since the Unix epoch, for provenance timestamps. At the I/O
+/// boundary (not the pure core), so reading the clock here is fine.
+fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

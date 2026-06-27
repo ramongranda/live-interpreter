@@ -20,24 +20,29 @@
 //! LI_ROLE=consumer cargo run --features native-audio --bin li-mesh
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use futures_util::StreamExt;
 use live_interpreter::asr::AsrEngine;
 use live_interpreter::capture::{self, CaptureConfig};
 use live_interpreter::config::Config;
 use live_interpreter::mesh::{
-    AudioChunk, LiveInterpreterMesh, MeshCommand, MeshConfig, MeshRole, NoopGpuTelemetry,
-    NvmlGpuTelemetry, RejectingAudioProcessor, VoiceReference,
+    AudioChunk, GpuTelemetry, LiveInterpreterMesh, MeshCommand, MeshConfig, MeshRole,
+    NoopGpuTelemetry, NvmlGpuTelemetry, RejectingAudioProcessor, VoiceReference,
 };
 use live_interpreter::mesh_pipeline::{PipelineMeshProcessor, f32_to_pcm_s16le};
+use live_interpreter::pipeline::Transcriber;
+use live_interpreter::quality::QualityTier;
 use live_interpreter::translate::Translator;
-use live_interpreter::types::{AudioSpec, Direction, Lang};
+use live_interpreter::types::{AudioSpec, Direction, Lane, Lang};
 use live_interpreter::virtual_mic::{AudioOutput, PipewireVirtualMic};
 use live_interpreter::voice::{
-    AudioFrame, HttpQwenBackend, VoiceIdentity, VoiceProfile, VoiceSample,
+    AudioFrame, HttpQwenBackend, VoiceIdentity, VoiceProfile, VoiceRoute, VoiceSample,
+    VoiceSynthesisBackend, VoiceSynthesisRequest, VoiceUsagePolicy, route_for_lane,
 };
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -50,13 +55,21 @@ async fn main() -> Result<()> {
     match role.as_str() {
         "provider" => run_provider().await,
         "consumer" => run_consumer().await,
-        other => anyhow::bail!("unknown LI_ROLE '{other}' (expected 'provider' or 'consumer')"),
+        "bench" => run_bench().await,
+        other => {
+            bail!("unknown LI_ROLE '{other}' (expected 'provider', 'consumer', or 'bench')")
+        }
     }
 }
 
 /// GPU provider: run the real pipeline for mesh audio tasks.
 async fn run_provider() -> Result<()> {
-    let config = Config::from_env()?;
+    let mut config = Config::from_env()?;
+    let tier = apply_quality_tier(&mut config);
+    tracing::info!(
+        "quality tier = {tier:?}, whisper model = {}",
+        config.whisper_model.display()
+    );
     let asr = AsrEngine::load(&config).context("Whisper model not found (set LI_WHISPER_MODEL)")?;
     let translator = Translator::from_env(config.ollama_url.clone(), config.ollama_model.clone())?;
     let voice = HttpQwenBackend::from_env();
@@ -182,10 +195,261 @@ async fn run_consumer() -> Result<()> {
 
 /// The consumer's own timbre from `LI_VOICE_REF`, shipped to the provider for
 /// cross-node cloning. Providing the file implies consent (it's your own voice).
+/// Bench (R11.1): measure the local pipeline latency stage by stage, so the
+/// CPU/GPU latency floor is a number you can track instead of a vibe.
+///
+/// Input (env, one required):
+///   * `LI_BENCH_WAV=<path.wav>` — full pipeline (ASR + translate + TTS).
+///   * `LI_BENCH_TEXT="…"`        — translate + TTS only (skips ASR).
+///
+/// `LI_DIRECTION` flips direction; `LI_BENCH_ITERS` sets the timed repeat count
+/// (default 3). One untimed warmup pass absorbs model-load / first-connection
+/// cost so iteration 1 isn't skewed. Voice route follows `LI_VOICE_REF` exactly
+/// like the provider (clone vs neutral).
+async fn run_bench() -> Result<()> {
+    let mut config = Config::from_env()?;
+    let tier = apply_quality_tier(&mut config);
+    let direction = direction_from_env();
+    let iters: usize = std::env::var("LI_BENCH_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3)
+        .max(1);
+
+    let wav_path = std::env::var("LI_BENCH_WAV").ok().map(PathBuf::from);
+    let fixed_text = std::env::var("LI_BENCH_TEXT").ok();
+    if wav_path.is_none() && fixed_text.is_none() {
+        bail!(
+            "bench needs LI_BENCH_WAV=<wav> (full pipeline) or LI_BENCH_TEXT=<text> (translate+TTS only)"
+        );
+    }
+    if let Some(p) = &wav_path
+        && !p.exists()
+    {
+        bail!("LI_BENCH_WAV not found: {}", p.display());
+    }
+
+    // Input audio seconds → real-time factor (RTF = processing / spoken time).
+    let input_secs = match &wav_path {
+        Some(p) => {
+            let (samples, sample_rate) = capture::read_wav_f32(p)?;
+            samples.len() as f64 / sample_rate.max(1) as f64
+        }
+        None => 0.0,
+    };
+
+    let asr = match &wav_path {
+        Some(_) => Some(
+            AsrEngine::load(&config).context("Whisper model not found (set LI_WHISPER_MODEL)")?,
+        ),
+        None => None,
+    };
+    let translator = Translator::from_env(config.ollama_url.clone(), config.ollama_model.clone())?;
+    let voice = HttpQwenBackend::from_env();
+    let (profile, identity) = voice_identity_from_env();
+    let route = route_for_lane(identity, Lane::Local);
+    let target_lang = match direction {
+        Direction::EsToEn => Lang::En,
+        Direction::EnToEs => Lang::Es,
+    };
+    let telemetry = NvmlGpuTelemetry;
+
+    let input_label = wav_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| format!("text:{:?}", fixed_text.as_deref().unwrap_or("")));
+    println!(
+        "bench — tier={tier:?} direction={direction:?} route={route:?} iters={iters} input={input_label}"
+    );
+    if wav_path.is_some() {
+        println!("       whisper model = {}", config.whisper_model.display());
+    }
+
+    // Warmup: pay model-load / first-connection cost once, untimed.
+    let warm = bench_once(
+        asr.as_ref(),
+        &translator,
+        &voice,
+        &profile,
+        route,
+        direction,
+        wav_path.as_deref(),
+        fixed_text.as_deref(),
+        target_lang,
+    )
+    .await
+    .context("warmup pass failed (is Ollama on :11434 and Qwen3-TTS on :8020?)")?;
+    println!(
+        "warmup ok — \"{}\" → \"{}\"",
+        warm.transcript.trim(),
+        warm.translation.trim()
+    );
+
+    let vram_before = telemetry.read().await.ok();
+    let mut ttfa_samples = Vec::with_capacity(iters);
+    let mut total_samples = Vec::with_capacity(iters);
+    for i in 0..iters {
+        let r = bench_once(
+            asr.as_ref(),
+            &translator,
+            &voice,
+            &profile,
+            route,
+            direction,
+            wav_path.as_deref(),
+            fixed_text.as_deref(),
+            target_lang,
+        )
+        .await?;
+        let rtf = if input_secs > 0.0 {
+            format!("{:.2}", r.total.as_secs_f64() / input_secs)
+        } else {
+            "n/a".into()
+        };
+        println!(
+            "#{:<2} asr={:>7} translate={:>7} tts_first={:>7} tts_full={:>7} total={:>7} ttfa={:>7} rtf={}",
+            i + 1,
+            r.asr.map(fmt_ms).unwrap_or_else(|| "—".into()),
+            fmt_ms(r.translate),
+            fmt_ms(r.tts_first),
+            fmt_ms(r.tts_full),
+            fmt_ms(r.total),
+            fmt_ms(r.ttfa),
+            rtf,
+        );
+        ttfa_samples.push(r.ttfa);
+        total_samples.push(r.total);
+    }
+    let vram_after = telemetry.read().await.ok();
+
+    ttfa_samples.sort_unstable();
+    total_samples.sort_unstable();
+    println!(
+        "— median ttfa={} total={}  (ttfa = time-to-first-audio: the conversational latency)",
+        fmt_ms(ttfa_samples[ttfa_samples.len() / 2]),
+        fmt_ms(total_samples[total_samples.len() / 2]),
+    );
+    if let (Some(a), Some(b)) = (&vram_before, &vram_after) {
+        println!(
+            "— vram free {}→{} MB of {} total",
+            a.free_vram_mb, b.free_vram_mb, b.total_vram_mb
+        );
+    }
+    if input_secs > 0.0 {
+        println!("— input audio {input_secs:.2}s (rtf < 1.0 = faster than real-time)");
+    }
+    Ok(())
+}
+
+/// Per-stage timings for one bench iteration. `ttfa` (time-to-first-audio) is the
+/// headline conversational metric: ASR + translate + first TTS frame.
+struct StageTimings {
+    asr: Option<Duration>,
+    translate: Duration,
+    tts_first: Duration,
+    tts_full: Duration,
+    total: Duration,
+    ttfa: Duration,
+    transcript: String,
+    translation: String,
+}
+
+/// Run one utterance through the real components, timing each stage. Uses only
+/// the public backend API (no internal pipeline timing hooks), so it mirrors the
+/// provider's exact path: `transcribe` → clean `translate` → `synthesize_stream`.
+#[allow(clippy::too_many_arguments)]
+async fn bench_once(
+    asr: Option<&AsrEngine>,
+    translator: &Translator,
+    voice: &HttpQwenBackend,
+    profile: &VoiceProfile,
+    route: VoiceRoute,
+    direction: Direction,
+    wav: Option<&Path>,
+    fixed_text: Option<&str>,
+    target_lang: Lang,
+) -> Result<StageTimings> {
+    let overall = Instant::now();
+
+    let (transcript, asr_dur) = match (asr, wav) {
+        (Some(asr), Some(wav)) => {
+            let t = Instant::now();
+            let text = asr.transcribe(wav, direction.source_lang()).await?;
+            (text, Some(t.elapsed()))
+        }
+        _ => (fixed_text.unwrap_or_default().to_string(), None),
+    };
+
+    let t = Instant::now();
+    let translation = translator.translate(&transcript, &direction).await?;
+    let translate = t.elapsed();
+
+    let (tts_first, tts_full) = if route == VoiceRoute::Off {
+        (Duration::ZERO, Duration::ZERO)
+    } else {
+        let request = VoiceSynthesisRequest {
+            text: translation.clone(),
+            lang: target_lang,
+            profile: profile.clone(),
+            neutral: route == VoiceRoute::Neutral,
+        };
+        let t = Instant::now();
+        let mut stream = voice.synthesize_stream(request).await?;
+        let first = stream.next().await;
+        let tts_first = t.elapsed();
+        if let Some(frame) = first {
+            frame?;
+        }
+        while let Some(frame) = stream.next().await {
+            frame?;
+        }
+        (tts_first, t.elapsed())
+    };
+
+    let total = overall.elapsed();
+    let ttfa = asr_dur.unwrap_or_default() + translate + tts_first;
+    Ok(StageTimings {
+        asr: asr_dur,
+        translate,
+        tts_first,
+        tts_full,
+        total,
+        ttfa,
+        transcript,
+        translation,
+    })
+}
+
+fn fmt_ms(d: Duration) -> String {
+    format!("{}ms", d.as_millis())
+}
+
+/// R11.3: when `LI_WHISPER_MODEL` is unset, fall back to the quality tier's model
+/// — but only if that file exists, so an explicit/working setup is never broken.
+/// Returns the effective tier (for logging).
+fn apply_quality_tier(config: &mut Config) -> QualityTier {
+    let tier = QualityTier::from_env();
+    if std::env::var("LI_WHISPER_MODEL").is_err() {
+        let candidate = PathBuf::from(tier.whisper_model());
+        if candidate.exists() {
+            config.whisper_model = candidate;
+        }
+    }
+    tier
+}
+
 fn consumer_voice_reference() -> Option<VoiceReference> {
     let path = PathBuf::from(std::env::var("LI_VOICE_REF").ok()?);
     if !path.exists() {
         tracing::info!("no LI_VOICE_REF → consumer ships no timbre (provider renders neutral)");
+        return None;
+    }
+    // R11.2: privacy gate. With LI_VOICE_ALLOW_REMOTE=0 the timbre never leaves
+    // this node — the provider then renders neutral.
+    if !VoiceUsagePolicy::from_env().may_ship_reference(true) {
+        tracing::info!(
+            "voice usage policy blocks remote synthesis → consumer keeps its timbre local"
+        );
         return None;
     }
     match capture::read_wav_f32(&path) {

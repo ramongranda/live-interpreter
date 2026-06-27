@@ -1,4 +1,5 @@
 use crate::types::Direction;
+use crate::voice::GeneratedAudioMeta;
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use futures_util::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
@@ -93,6 +94,9 @@ pub struct AudioTaskResult {
     pub translation: String,
     pub tts_sample_rate_hz: u32,
     pub tts_output: Vec<f32>,
+    /// R11.4 — provenance of the synthesized audio; `None` when nothing was
+    /// rendered (e.g. text-only) or provenance was disabled.
+    pub meta: Option<GeneratedAudioMeta>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -223,6 +227,7 @@ impl MeshAudioProcessor for NotReadyAudioProcessor {
             translation: "mesh GPU provider is running but audio pipeline is not wired yet".into(),
             tts_sample_rate_hz: chunk.sample_rate_hz,
             tts_output: Vec::new(),
+            meta: None,
         })
     }
 }
@@ -615,7 +620,10 @@ where
     }
 
     fn best_provider(&self, excluded: &[PeerId]) -> Option<PeerId> {
-        select_best_provider(self.providers.values(), excluded).map(|provider| provider.peer_id)
+        let selected = select_best_provider(self.providers.values(), excluded)?;
+        // R11.5: surface the whole-utterance routing decision for explainability.
+        tracing::info!("{}", explain_route(selected));
+        Some(selected.peer_id)
     }
 }
 
@@ -665,6 +673,32 @@ fn select_best_provider<'a>(
         .max_by_key(|provider| provider.rank_key())
 }
 
+/// R11.5 — human-readable explanation of why a provider won the routing for an
+/// utterance. **Whole-utterance** routing (not per-stage, per the R11 decision):
+/// the entire ASR→translate→TTS chain runs on the chosen node.
+///
+/// Example: `utterance → …Qm3FbA9: 18ms RTT, 4096 MB free, 1 active session(s)`.
+pub fn explain_route(score: &ProviderScore) -> String {
+    let latency = if score.avg_latency_ms == 0 {
+        "latency unknown (probing)".to_string()
+    } else {
+        format!("{}ms RTT", score.avg_latency_ms)
+    };
+    format!(
+        "utterance → {}: {}, {} MB free, {} active session(s)",
+        short_peer(&score.peer_id),
+        latency,
+        score.free_vram_mb,
+        score.active_sessions,
+    )
+}
+
+/// Last 8 chars of a peer id, prefixed with `…`, for readable logs/UI.
+fn short_peer(peer_id: &PeerId) -> String {
+    let full = peer_id.to_string();
+    format!("…{}", &full[full.len().saturating_sub(8)..])
+}
+
 /// Mesh access control: `None` expected = open mesh (accept anyone); otherwise
 /// the presented token must match exactly.
 fn token_matches(expected: &Option<String>, presented: &Option<String>) -> bool {
@@ -705,6 +739,18 @@ mod tests {
             last_seen: Instant::now(),
             avg_latency_ms,
         }
+    }
+
+    #[test]
+    fn explain_route_reports_latency_and_resources() {
+        let measured = explain_route(&score(peer(), 4_096, 1, 18));
+        assert!(measured.starts_with("utterance → "));
+        assert!(measured.contains("18ms RTT"));
+        assert!(measured.contains("4096 MB free"));
+        assert!(measured.contains("1 active session(s)"));
+
+        let unknown = explain_route(&score(peer(), 8_000, 0, 0));
+        assert!(unknown.contains("latency unknown"));
     }
 
     #[test]

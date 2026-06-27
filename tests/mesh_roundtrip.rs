@@ -46,6 +46,7 @@ impl MeshAudioProcessor for EchoProcessor {
             translation: "hello world".into(),
             tts_sample_rate_hz: 24_000,
             tts_output: vec![0.1, 0.2, 0.3],
+            meta: None,
         })
     }
 }
