@@ -31,6 +31,9 @@ pub struct MeshConfig {
     pub health_interval: Duration,
     pub provider_stale_after: Duration,
     pub local_role: MeshRole,
+    /// Shared secret gating the mesh. `None` = open mesh (LAN). When set, peers
+    /// only trust providers and accept audio tasks carrying the same token.
+    pub auth_token: Option<String>,
 }
 
 impl Default for MeshConfig {
@@ -42,6 +45,7 @@ impl Default for MeshConfig {
             health_interval: Duration::from_secs(3),
             provider_stale_after: Duration::from_secs(12),
             local_role: MeshRole::Consumer,
+            auth_token: None,
         }
     }
 }
@@ -76,6 +80,8 @@ pub struct AudioChunk {
     pub samples: Vec<f32>,
     /// Consumer timbre for cross-node cloning; see [`VoiceReference`].
     pub voice_ref: Option<VoiceReference>,
+    /// Shared mesh secret; the provider drops the task if it doesn't match.
+    pub auth_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -98,7 +104,13 @@ pub struct MeshHealth {
     pub total_vram_mb: u64,
     pub active_sessions: u32,
     pub unix_ms: u64,
+    /// Shared mesh secret; consumers ignore providers whose token mismatches.
+    pub token: Option<String>,
 }
+
+/// Effective latency assigned to a provider we haven't measured yet: low enough
+/// to be probed over a known-slow node, high enough not to evict a known-fast one.
+const LATENCY_UNKNOWN_RANK_MS: u64 = 3_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderScore {
@@ -106,11 +118,25 @@ pub struct ProviderScore {
     pub free_vram_mb: u64,
     pub active_sessions: u32,
     pub last_seen: Instant,
+    /// EWMA of observed round-trip latency (ms); 0 = not yet measured.
+    pub avg_latency_ms: u64,
 }
 
 impl ProviderScore {
-    fn rank_key(&self) -> (u64, std::cmp::Reverse<u32>) {
-        (self.free_vram_mb, std::cmp::Reverse(self.active_sessions))
+    /// Ranking for `max_by_key`: prefer lowest (effective) latency, then most
+    /// free VRAM, then fewest active sessions. Real-time routing favours the
+    /// consistently faster node once it has been measured.
+    fn rank_key(&self) -> (std::cmp::Reverse<u64>, u64, std::cmp::Reverse<u32>) {
+        let effective_latency = if self.avg_latency_ms == 0 {
+            LATENCY_UNKNOWN_RANK_MS
+        } else {
+            self.avg_latency_ms
+        };
+        (
+            std::cmp::Reverse(effective_latency),
+            self.free_vram_mb,
+            std::cmp::Reverse(self.active_sessions),
+        )
     }
 }
 
@@ -322,6 +348,7 @@ struct PendingAudioTask {
     chunk: AudioChunk,
     attempted: Vec<PeerId>,
     reply: oneshot::Sender<anyhow::Result<AudioTaskResult>>,
+    sent_at: Instant,
 }
 
 impl<T, P> LiveInterpreterMesh<T, P>
@@ -417,6 +444,7 @@ where
                 chunk,
                 attempted: vec![peer_id],
                 reply,
+                sent_at: Instant::now(),
             },
         );
     }
@@ -456,16 +484,23 @@ where
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
-                    if self.config.local_role == MeshRole::GpuProvider {
+                    let authorized = token_matches(&self.config.auth_token, &request.auth_token);
+                    if self.config.local_role == MeshRole::GpuProvider && authorized {
                         let result = self.processor.process(request).await?;
                         let _ = swarm.behaviour_mut().audio.send_response(channel, result);
                     }
+                    // Unauthorized or non-provider: drop silently → consumer times
+                    // out and fails over to another peer.
                 }
                 request_response::Message::Response {
                     request_id,
                     response,
                 } => {
                     if let Some(pending) = self.pending.remove(&request_id) {
+                        if let Some(peer) = pending.attempted.last() {
+                            let elapsed = pending.sent_at.elapsed().as_millis() as u64;
+                            self.record_latency(*peer, elapsed);
+                        }
                         let _ = pending.reply.send(Ok(response));
                     }
                 }
@@ -500,10 +535,14 @@ where
             total_vram_mb: snapshot.total_vram_mb,
             active_sessions: snapshot.active_sessions,
             unix_ms: current_unix_ms(),
+            token: self.config.auth_token.clone(),
         })
     }
 
     fn observe_health(&mut self, health: MeshHealth) {
+        if !token_matches(&self.config.auth_token, &health.token) {
+            return; // provider not on our mesh (token mismatch)
+        }
         let Ok(peer_id) = health.peer_id.parse::<PeerId>() else {
             return;
         };
@@ -513,6 +552,13 @@ where
             return;
         }
 
+        // Preserve any latency we've already measured for this peer across the
+        // periodic health refresh.
+        let avg_latency_ms = self
+            .providers
+            .get(&peer_id)
+            .map(|provider| provider.avg_latency_ms)
+            .unwrap_or(0);
         self.providers.insert(
             peer_id,
             ProviderScore {
@@ -520,8 +566,21 @@ where
                 free_vram_mb: health.free_vram_mb,
                 active_sessions: health.active_sessions,
                 last_seen: Instant::now(),
+                avg_latency_ms,
             },
         );
+    }
+
+    /// Fold an observed round-trip latency into a provider's EWMA (3:1 toward
+    /// history), so routing tracks sustained speed rather than one-off spikes.
+    fn record_latency(&mut self, peer_id: PeerId, latency_ms: u64) {
+        if let Some(provider) = self.providers.get_mut(&peer_id) {
+            provider.avg_latency_ms = if provider.avg_latency_ms == 0 {
+                latency_ms
+            } else {
+                (provider.avg_latency_ms * 3 + latency_ms) / 4
+            };
+        }
     }
 
     fn retry_or_fail(
@@ -536,6 +595,7 @@ where
 
         if let Some(next_peer) = self.best_provider(&pending.attempted) {
             pending.attempted.push(next_peer);
+            pending.sent_at = Instant::now();
             let next_request_id = swarm
                 .behaviour_mut()
                 .audio
@@ -605,6 +665,15 @@ fn select_best_provider<'a>(
         .max_by_key(|provider| provider.rank_key())
 }
 
+/// Mesh access control: `None` expected = open mesh (accept anyone); otherwise
+/// the presented token must match exactly.
+fn token_matches(expected: &Option<String>, presented: &Option<String>) -> bool {
+    match expected {
+        None => true,
+        Some(secret) => presented.as_deref() == Some(secret.as_str()),
+    }
+}
+
 fn current_unix_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -619,31 +688,33 @@ mod tests {
     use super::*;
     use libp2p::identity;
 
+    fn peer() -> PeerId {
+        identity::Keypair::generate_ed25519().public().to_peer_id()
+    }
+
+    fn score(
+        peer_id: PeerId,
+        free_vram_mb: u64,
+        active_sessions: u32,
+        avg_latency_ms: u64,
+    ) -> ProviderScore {
+        ProviderScore {
+            peer_id,
+            free_vram_mb,
+            active_sessions,
+            last_seen: Instant::now(),
+            avg_latency_ms,
+        }
+    }
+
     #[test]
     fn selects_provider_with_most_free_vram_then_fewer_sessions() {
-        let peer_a = identity::Keypair::generate_ed25519().public().to_peer_id();
-        let peer_b = identity::Keypair::generate_ed25519().public().to_peer_id();
-        let peer_c = identity::Keypair::generate_ed25519().public().to_peer_id();
-        let now = Instant::now();
+        // All latencies equal (unknown) → falls through to VRAM then sessions.
+        let (peer_a, peer_b, peer_c) = (peer(), peer(), peer());
         let providers = vec![
-            ProviderScore {
-                peer_id: peer_a,
-                free_vram_mb: 16_000,
-                active_sessions: 2,
-                last_seen: now,
-            },
-            ProviderScore {
-                peer_id: peer_b,
-                free_vram_mb: 24_000,
-                active_sessions: 4,
-                last_seen: now,
-            },
-            ProviderScore {
-                peer_id: peer_c,
-                free_vram_mb: 24_000,
-                active_sessions: 1,
-                last_seen: now,
-            },
+            score(peer_a, 16_000, 2, 0),
+            score(peer_b, 24_000, 4, 0),
+            score(peer_c, 24_000, 1, 0),
         ];
 
         let selected = select_best_provider(&providers, &[]).unwrap();
@@ -653,27 +724,103 @@ mod tests {
 
     #[test]
     fn excludes_failed_provider_on_failover_selection() {
-        let peer_a = identity::Keypair::generate_ed25519().public().to_peer_id();
-        let peer_b = identity::Keypair::generate_ed25519().public().to_peer_id();
-        let now = Instant::now();
-        let providers = vec![
-            ProviderScore {
-                peer_id: peer_a,
-                free_vram_mb: 32_000,
-                active_sessions: 0,
-                last_seen: now,
-            },
-            ProviderScore {
-                peer_id: peer_b,
-                free_vram_mb: 16_000,
-                active_sessions: 0,
-                last_seen: now,
-            },
-        ];
+        let (peer_a, peer_b) = (peer(), peer());
+        let providers = vec![score(peer_a, 32_000, 0, 0), score(peer_b, 16_000, 0, 0)];
 
         let selected = select_best_provider(&providers, &[peer_a]).unwrap();
 
         assert_eq!(selected.peer_id, peer_b);
+    }
+
+    #[test]
+    fn prefers_lower_latency_provider_over_more_vram() {
+        // Real-time routing: a measured-fast node beats a slower one with more VRAM.
+        let (fast, slow) = (peer(), peer());
+        let providers = vec![score(slow, 32_000, 0, 5_000), score(fast, 8_000, 0, 800)];
+        assert_eq!(select_best_provider(&providers, &[]).unwrap().peer_id, fast);
+    }
+
+    #[test]
+    fn unknown_latency_is_probed_over_known_slow_but_loses_to_known_fast() {
+        let (unknown, slow, fast) = (peer(), peer(), peer());
+        // Unknown (effective 3000ms) beats a known-5000ms node...
+        let vs_slow = vec![score(unknown, 8_000, 0, 0), score(slow, 8_000, 0, 5_000)];
+        assert_eq!(
+            select_best_provider(&vs_slow, &[]).unwrap().peer_id,
+            unknown
+        );
+        // ...but loses to a known-1000ms node.
+        let vs_fast = vec![score(unknown, 8_000, 0, 0), score(fast, 8_000, 0, 1_000)];
+        assert_eq!(select_best_provider(&vs_fast, &[]).unwrap().peer_id, fast);
+    }
+
+    #[test]
+    fn record_latency_seeds_then_smooths_ewma() {
+        let mut mesh = LiveInterpreterMesh::new(
+            MeshConfig::default(),
+            NoopGpuTelemetry,
+            RejectingAudioProcessor,
+        );
+        let p = peer();
+        mesh.providers.insert(p, score(p, 8_000, 0, 0));
+        mesh.record_latency(p, 1_000); // first sample seeds directly
+        assert_eq!(mesh.providers[&p].avg_latency_ms, 1_000);
+        mesh.record_latency(p, 5_000); // EWMA: (1000*3 + 5000)/4 = 2000
+        assert_eq!(mesh.providers[&p].avg_latency_ms, 2_000);
+    }
+
+    #[test]
+    fn token_matches_open_and_secret_meshes() {
+        assert!(token_matches(&None, &None));
+        assert!(token_matches(&None, &Some("anything".into()))); // open mesh
+        assert!(token_matches(&Some("s".into()), &Some("s".into())));
+        assert!(!token_matches(&Some("s".into()), &Some("other".into())));
+        assert!(!token_matches(&Some("s".into()), &None));
+    }
+
+    #[test]
+    fn observe_health_ignores_provider_with_wrong_token() {
+        let mut mesh = LiveInterpreterMesh::new(
+            MeshConfig {
+                auth_token: Some("secret".into()),
+                ..MeshConfig::default()
+            },
+            NoopGpuTelemetry,
+            RejectingAudioProcessor,
+        );
+        // Wrong token → not added.
+        mesh.observe_health(health(peer(), MeshRole::GpuProvider, Some("nope".into())));
+        assert!(mesh.providers.is_empty());
+        // Matching token → added.
+        mesh.observe_health(health(peer(), MeshRole::GpuProvider, Some("secret".into())));
+        assert_eq!(mesh.providers.len(), 1);
+    }
+
+    #[test]
+    fn observe_health_preserves_measured_latency_across_refresh() {
+        let mut mesh = LiveInterpreterMesh::new(
+            MeshConfig::default(),
+            NoopGpuTelemetry,
+            RejectingAudioProcessor,
+        );
+        let p = peer();
+        mesh.observe_health(health(p, MeshRole::GpuProvider, None));
+        mesh.record_latency(p, 900);
+        // A fresh health tick must not wipe the measured latency.
+        mesh.observe_health(health(p, MeshRole::GpuProvider, None));
+        assert_eq!(mesh.providers[&p].avg_latency_ms, 900);
+    }
+
+    fn health(peer: PeerId, role: MeshRole, token: Option<String>) -> MeshHealth {
+        MeshHealth {
+            peer_id: peer.to_string(),
+            role,
+            free_vram_mb: 8_000,
+            total_vram_mb: 16_000,
+            active_sessions: 0,
+            unix_ms: 1,
+            token,
+        }
     }
 
     #[test]
@@ -685,6 +832,7 @@ mod tests {
             direction: Direction::EsToEn,
             samples: vec![0.0, 0.5, -0.25],
             voice_ref: None,
+            auth_token: None,
         };
 
         let bytes = bincode::serialize(&chunk).unwrap();
@@ -707,6 +855,7 @@ mod tests {
                 transcript: Some("En un lugar de la Mancha".into()),
                 consent_confirmed: true,
             }),
+            auth_token: Some("secret".into()),
         };
 
         let bytes = bincode::serialize(&chunk).unwrap();
@@ -717,31 +866,17 @@ mod tests {
 
     #[test]
     fn consumer_health_removes_provider() {
-        let peer = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let p = peer();
         let mut mesh = LiveInterpreterMesh::new(
             MeshConfig::default(),
             NoopGpuTelemetry,
             RejectingAudioProcessor,
         );
-        mesh.observe_health(MeshHealth {
-            peer_id: peer.to_string(),
-            role: MeshRole::GpuProvider,
-            free_vram_mb: 8_000,
-            total_vram_mb: 16_000,
-            active_sessions: 0,
-            unix_ms: 1,
-        });
+        mesh.observe_health(health(p, MeshRole::GpuProvider, None));
         assert_eq!(mesh.providers.len(), 1);
 
-        mesh.observe_health(MeshHealth {
-            peer_id: peer.to_string(),
-            role: MeshRole::Consumer,
-            free_vram_mb: 0,
-            total_vram_mb: 0,
-            active_sessions: 0,
-            unix_ms: 2,
-        });
-
+        // The same peer re-announcing as a consumer drops it from the table.
+        mesh.observe_health(health(p, MeshRole::Consumer, None));
         assert!(mesh.providers.is_empty());
     }
 }

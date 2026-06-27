@@ -76,6 +76,7 @@ async fn run_provider() -> Result<()> {
     let mesh = LiveInterpreterMesh::new(
         MeshConfig {
             local_role: MeshRole::GpuProvider,
+            auth_token: mesh_token(),
             ..MeshConfig::default()
         },
         NvmlGpuTelemetry,
@@ -100,12 +101,16 @@ async fn run_provider() -> Result<()> {
 /// Consumer: capture → mesh → play the translated voice into the virtual mic.
 async fn run_consumer() -> Result<()> {
     let direction = direction_from_env();
+    let token = mesh_token();
     let mic =
         PipewireVirtualMic::spawn(AudioSpec::mono_s16le(24_000), "live-interpreter-mic-source")
             .context("failed to start PipeWire virtual mic")?;
 
     let mesh = LiveInterpreterMesh::new(
-        MeshConfig::default(), // local_role = Consumer
+        MeshConfig {
+            auth_token: token.clone(),
+            ..MeshConfig::default() // local_role = Consumer
+        },
         NoopGpuTelemetry,
         RejectingAudioProcessor,
     );
@@ -140,6 +145,7 @@ async fn run_consumer() -> Result<()> {
             samples: utterance,
             // Ship the timbre once per session (first chunk); the provider caches it.
             voice_ref: if seq == 0 { voice_ref.clone() } else { None },
+            auth_token: token.clone(),
         };
         let (reply_tx, reply_rx) = oneshot::channel();
         if commands
@@ -197,6 +203,13 @@ fn consumer_voice_reference() -> Option<VoiceReference> {
             None
         }
     }
+}
+
+/// Shared mesh secret from `LI_MESH_TOKEN`; `None` (unset/empty) = open mesh.
+fn mesh_token() -> Option<String> {
+    std::env::var("LI_MESH_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
 }
 
 /// Direction from `LI_DIRECTION` (`en_to_es` flips; default `es_to_en`).

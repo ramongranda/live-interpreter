@@ -351,6 +351,7 @@ mod tests {
             direction: Direction::EsToEn,
             samples: vec![0.0; 1600],
             voice_ref,
+            auth_token: None,
         }
     }
 
