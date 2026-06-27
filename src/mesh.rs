@@ -53,6 +53,19 @@ pub enum MeshRole {
     Consumer,
 }
 
+/// The consumer's reference voice, shipped so a provider can render the
+/// translation in the consumer's own timbre. Consent-gated. Sent once per
+/// session (with the first chunk) and cached by the provider; `None` on later
+/// chunks and whenever the consumer opts out of cloning.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceReference {
+    pub sample_rate_hz: u32,
+    pub samples: Vec<f32>,
+    pub transcript: Option<String>,
+    pub consent_confirmed: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AudioChunk {
@@ -61,6 +74,8 @@ pub struct AudioChunk {
     pub sample_rate_hz: u32,
     pub direction: Direction,
     pub samples: Vec<f32>,
+    /// Consumer timbre for cross-node cloning; see [`VoiceReference`].
+    pub voice_ref: Option<VoiceReference>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -669,6 +684,29 @@ mod tests {
             sample_rate_hz: 16_000,
             direction: Direction::EsToEn,
             samples: vec![0.0, 0.5, -0.25],
+            voice_ref: None,
+        };
+
+        let bytes = bincode::serialize(&chunk).unwrap();
+        let decoded: AudioChunk = bincode::deserialize(&bytes).unwrap();
+
+        assert_eq!(decoded, chunk);
+    }
+
+    #[test]
+    fn bincode_roundtrip_keeps_voice_reference() {
+        let chunk = AudioChunk {
+            session_id: Uuid::new_v4(),
+            sequence: 0,
+            sample_rate_hz: 24_000,
+            direction: Direction::EsToEn,
+            samples: vec![0.1, 0.2],
+            voice_ref: Some(VoiceReference {
+                sample_rate_hz: 24_000,
+                samples: vec![0.3, -0.3, 0.6],
+                transcript: Some("En un lugar de la Mancha".into()),
+                consent_confirmed: true,
+            }),
         };
 
         let bytes = bincode::serialize(&chunk).unwrap();

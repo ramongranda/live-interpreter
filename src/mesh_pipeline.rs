@@ -12,21 +12,22 @@
 //! orchestration) for SRP. The PCM conversions and event→result projection are
 //! pure and unit-tested; only `process` does I/O.
 //!
-//! Limitation: the provider renders with *its own* configured `VoiceProfile` /
-//! `VoiceIdentity` (the consumer's reference timbre is not yet transmitted over
-//! the wire), so cross-node cloning defaults to the neutral voice unless the
-//! provider is configured with a profile. Carrying the profile in `AudioChunk`
-//! is a follow-up.
+//! Cross-node cloning: when a chunk carries a [`VoiceReference`] the provider
+//! builds a consent-gated profile and caches it per `session_id`, so the
+//! consumer's *own timbre* travels over the wire and renders the translation —
+//! later (reference-less) chunks reuse the cache. Without a reference it falls
+//! back to the provider's configured profile/identity (neutral by default).
 
-use crate::mesh::{AudioChunk, AudioTaskResult, MeshAudioProcessor};
+use crate::mesh::{AudioChunk, AudioTaskResult, MeshAudioProcessor, VoiceReference};
 use crate::pipeline::{TextTranslator, Transcriber, interpret_utterance};
-use crate::types::{Lane, PipelineEvent};
+use crate::types::{Lane, Lang, PipelineEvent};
 use crate::virtual_mic::MockAudioOutput;
-use crate::voice::{VoiceIdentity, VoiceProfile, VoiceSynthesisBackend};
+use crate::voice::{VoiceIdentity, VoiceProfile, VoiceSample, VoiceSynthesisBackend};
 use anyhow::Result;
 use async_trait::async_trait;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 /// Decode interleaved s16le bytes into normalized `f32` samples.
@@ -84,14 +85,55 @@ pub fn collect_interpreted(events: &[PipelineEvent], fallback_rate: u32) -> Inte
     }
 }
 
+/// Build a consent-gated profile (and its routing identity) from a voice
+/// reference shipped over the mesh, writing the reference WAV to `wav_path` so
+/// the synthesis backend can read it. A reference without consent renders neutral.
+pub fn profile_from_reference(
+    reference: &VoiceReference,
+    wav_path: &Path,
+    session_id: Uuid,
+) -> Result<(VoiceProfile, VoiceIdentity)> {
+    crate::capture::write_wav_16le(wav_path, &reference.samples, reference.sample_rate_hz)?;
+    let profile = VoiceProfile {
+        id: session_id,
+        name: "mesh-peer".into(),
+        owner: "mesh-peer".into(),
+        consent_confirmed: reference.consent_confirmed,
+        samples: vec![VoiceSample {
+            path: wav_path.to_path_buf(),
+            transcript: reference.transcript.clone(),
+            lang: Lang::Es,
+            duration_ms: 0,
+            sample_rate: reference.sample_rate_hz,
+        }],
+        embedding_path: None,
+        default_lang: Lang::Es,
+        quality_score: 1.0,
+        created_at: chrono::Utc::now(),
+    };
+    let identity = if profile.is_usable() {
+        VoiceIdentity::MyProfile
+    } else {
+        VoiceIdentity::Neutral
+    };
+    Ok((profile, identity))
+}
+
 /// Runs the real interpretation pipeline for mesh audio tasks (provider side).
+///
+/// When a chunk carries a [`VoiceReference`] the provider builds and caches the
+/// consumer's profile per `session_id`, so the translation is rendered in the
+/// consumer's timbre on later (reference-less) chunks too. Without any reference
+/// it falls back to the provider's own configured profile/identity.
 pub struct PipelineMeshProcessor {
     asr: Arc<dyn Transcriber>,
     translator: Arc<dyn TextTranslator>,
     voice: Arc<dyn VoiceSynthesisBackend>,
-    profile: VoiceProfile,
-    identity: VoiceIdentity,
+    fallback_profile: VoiceProfile,
+    fallback_identity: VoiceIdentity,
     uploads_dir: PathBuf,
+    voice_dir: PathBuf,
+    session_profiles: Mutex<HashMap<Uuid, (VoiceProfile, VoiceIdentity)>>,
 }
 
 impl PipelineMeshProcessor {
@@ -99,24 +141,56 @@ impl PipelineMeshProcessor {
         asr: Arc<dyn Transcriber>,
         translator: Arc<dyn TextTranslator>,
         voice: Arc<dyn VoiceSynthesisBackend>,
-        profile: VoiceProfile,
-        identity: VoiceIdentity,
+        fallback_profile: VoiceProfile,
+        fallback_identity: VoiceIdentity,
         uploads_dir: PathBuf,
+        voice_dir: PathBuf,
     ) -> Self {
         Self {
             asr,
             translator,
             voice,
-            profile,
-            identity,
+            fallback_profile,
+            fallback_identity,
             uploads_dir,
+            voice_dir,
+            session_profiles: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Resolve which (profile, identity) renders this chunk: a fresh reference
+    /// updates the per-session cache; otherwise use the cached or fallback one.
+    fn resolve_voice(&self, chunk: &AudioChunk) -> Result<(VoiceProfile, VoiceIdentity)> {
+        if let Some(reference) = &chunk.voice_ref {
+            std::fs::create_dir_all(&self.voice_dir).ok();
+            let path = self
+                .voice_dir
+                .join(format!("mesh-ref-{}.wav", chunk.session_id));
+            let resolved = profile_from_reference(reference, &path, chunk.session_id)?;
+            self.session_profiles
+                .lock()
+                .unwrap()
+                .insert(chunk.session_id, resolved.clone());
+            return Ok(resolved);
+        }
+        if let Some(cached) = self
+            .session_profiles
+            .lock()
+            .unwrap()
+            .get(&chunk.session_id)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+        Ok((self.fallback_profile.clone(), self.fallback_identity))
     }
 }
 
 #[async_trait]
 impl MeshAudioProcessor for PipelineMeshProcessor {
     async fn process(&self, chunk: AudioChunk) -> Result<AudioTaskResult> {
+        let (profile, identity) = self.resolve_voice(&chunk)?;
+
         std::fs::create_dir_all(&self.uploads_dir).ok();
         let wav = self
             .uploads_dir
@@ -131,10 +205,10 @@ impl MeshAudioProcessor for PipelineMeshProcessor {
             &*self.translator,
             &*self.voice,
             &sink,
-            &self.profile,
+            &profile,
             &wav,
             chunk.direction,
-            self.identity,
+            identity,
             Lane::Local,
             Uuid::new_v4(),
             0,
@@ -257,29 +331,93 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn processor_runs_pipeline_and_returns_translated_audio() {
-        let processor = PipelineMeshProcessor::new(
+    fn processor() -> PipelineMeshProcessor {
+        PipelineMeshProcessor::new(
             Arc::new(MockAsr("hola mundo")),
             Arc::new(MockTranslator("hello world")),
             Arc::new(MockVoiceBackend::default()),
             neutral_profile(),
             VoiceIdentity::Neutral,
             std::env::temp_dir().join("li-mesh-test-uploads"),
-        );
-        let chunk = AudioChunk {
-            session_id: Uuid::new_v4(),
-            sequence: 7,
+            std::env::temp_dir().join("li-mesh-test-voice"),
+        )
+    }
+
+    fn chunk(session_id: Uuid, sequence: u64, voice_ref: Option<VoiceReference>) -> AudioChunk {
+        AudioChunk {
+            session_id,
+            sequence,
             sample_rate_hz: 16_000,
             direction: Direction::EsToEn,
             samples: vec![0.0; 1600],
-        };
-        let result = processor.process(chunk).await.expect("process ok");
+            voice_ref,
+        }
+    }
+
+    #[tokio::test]
+    async fn processor_runs_pipeline_and_returns_translated_audio() {
+        let result = processor()
+            .process(chunk(Uuid::new_v4(), 7, None))
+            .await
+            .expect("process ok");
         assert_eq!(result.sequence, 7);
         assert_eq!(result.transcription, "hola mundo");
         assert_eq!(result.translation, "hello world");
         assert_eq!(result.tts_sample_rate_hz, 24_000);
         // MockVoiceBackend emits 1 s16le sample per character of "hello world".
         assert!(!result.tts_output.is_empty());
+    }
+
+    #[test]
+    fn profile_from_reference_clones_with_consent_neutral_without() {
+        let path = std::env::temp_dir().join("li-ref-consent.wav");
+        let consented = VoiceReference {
+            sample_rate_hz: 24_000,
+            samples: vec![0.0; 100],
+            transcript: Some("hola".into()),
+            consent_confirmed: true,
+        };
+        let (profile, identity) =
+            profile_from_reference(&consented, &path, Uuid::nil()).expect("build");
+        assert!(profile.is_usable());
+        assert_eq!(identity, VoiceIdentity::MyProfile);
+
+        let unconsented = VoiceReference {
+            consent_confirmed: false,
+            ..consented
+        };
+        let (_, identity) =
+            profile_from_reference(&unconsented, &path, Uuid::nil()).expect("build");
+        assert_eq!(identity, VoiceIdentity::Neutral);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn reference_is_cached_per_session_for_later_chunks() {
+        let processor = processor();
+        let session = Uuid::new_v4();
+        let reference = VoiceReference {
+            sample_rate_hz: 24_000,
+            samples: vec![0.1; 200],
+            transcript: Some("hola".into()),
+            consent_confirmed: true,
+        };
+        // First chunk carries the reference → session cached as MyProfile/clone.
+        processor
+            .process(chunk(session, 0, Some(reference)))
+            .await
+            .expect("seq0 ok");
+        let (_, identity) = processor.resolve_voice(&chunk(session, 1, None)).unwrap();
+        assert_eq!(
+            identity,
+            VoiceIdentity::MyProfile,
+            "later chunks reuse the cached clone"
+        );
+
+        // A different session with no reference falls back to neutral.
+        let (_, identity) = processor
+            .resolve_voice(&chunk(Uuid::new_v4(), 0, None))
+            .unwrap();
+        assert_eq!(identity, VoiceIdentity::Neutral);
     }
 }

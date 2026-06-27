@@ -30,7 +30,7 @@ use live_interpreter::capture::{self, CaptureConfig};
 use live_interpreter::config::Config;
 use live_interpreter::mesh::{
     AudioChunk, LiveInterpreterMesh, MeshCommand, MeshConfig, MeshRole, NoopGpuTelemetry,
-    NvmlGpuTelemetry, RejectingAudioProcessor,
+    NvmlGpuTelemetry, RejectingAudioProcessor, VoiceReference,
 };
 use live_interpreter::mesh_pipeline::{PipelineMeshProcessor, f32_to_pcm_s16le};
 use live_interpreter::translate::Translator;
@@ -62,6 +62,7 @@ async fn run_provider() -> Result<()> {
     let voice = HttpQwenBackend::from_env();
     let (profile, identity) = voice_identity_from_env();
     let uploads = config.data_dir.join("uploads");
+    let voice_dir = config.data_dir.join("voice");
 
     let processor = PipelineMeshProcessor::new(
         Arc::new(asr),
@@ -70,6 +71,7 @@ async fn run_provider() -> Result<()> {
         profile,
         identity,
         uploads,
+        voice_dir,
     );
     let mesh = LiveInterpreterMesh::new(
         MeshConfig {
@@ -121,6 +123,7 @@ async fn run_consumer() -> Result<()> {
     let mut utterances = cap.utterances;
     let session_id = Uuid::new_v4();
     let sequence = AtomicU64::new(0);
+    let voice_ref = consumer_voice_reference();
     tracing::info!(
         "mesh consumer listening ({sample_rate} Hz, {} ch) → {direction:?}; output on \
          'live-interpreter-mic-source'. Needs a provider on the LAN.",
@@ -128,12 +131,15 @@ async fn run_consumer() -> Result<()> {
     );
 
     while let Some(utterance) = utterances.recv().await {
+        let seq = sequence.fetch_add(1, Ordering::Relaxed);
         let chunk = AudioChunk {
             session_id,
-            sequence: sequence.fetch_add(1, Ordering::Relaxed),
+            sequence: seq,
             sample_rate_hz: sample_rate,
             direction,
             samples: utterance,
+            // Ship the timbre once per session (first chunk); the provider caches it.
+            voice_ref: if seq == 0 { voice_ref.clone() } else { None },
         };
         let (reply_tx, reply_rx) = oneshot::channel();
         if commands
@@ -166,6 +172,31 @@ async fn run_consumer() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The consumer's own timbre from `LI_VOICE_REF`, shipped to the provider for
+/// cross-node cloning. Providing the file implies consent (it's your own voice).
+fn consumer_voice_reference() -> Option<VoiceReference> {
+    let path = PathBuf::from(std::env::var("LI_VOICE_REF").ok()?);
+    if !path.exists() {
+        tracing::info!("no LI_VOICE_REF → consumer ships no timbre (provider renders neutral)");
+        return None;
+    }
+    match capture::read_wav_f32(&path) {
+        Ok((samples, sample_rate_hz)) => {
+            tracing::info!("voice reference loaded → consumer ships its timbre to the provider");
+            Some(VoiceReference {
+                sample_rate_hz,
+                samples,
+                transcript: std::env::var("LI_VOICE_REF_TEXT").ok(),
+                consent_confirmed: true,
+            })
+        }
+        Err(error) => {
+            tracing::warn!("failed to read LI_VOICE_REF: {error:#}");
+            None
+        }
+    }
 }
 
 /// Direction from `LI_DIRECTION` (`en_to_es` flips; default `es_to_en`).

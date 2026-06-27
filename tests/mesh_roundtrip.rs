@@ -90,6 +90,7 @@ async fn audio_task_round_trips_provider_to_consumer() {
         sample_rate_hz: 16_000,
         direction: Direction::EsToEn,
         samples: vec![0.0; 1600],
+        voice_ref: None,
     };
 
     // Poll: SubmitAudio fails fast while no provider is known yet, so retry until

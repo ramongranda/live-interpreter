@@ -86,6 +86,38 @@ pub fn write_wav_16le(path: &std::path::Path, samples: &[f32], sample_rate: u32)
     Ok(())
 }
 
+/// Read a WAV (int or float, any channel count) into mono `f32` samples and its
+/// sample rate. Used to ship a voice reference over the mesh.
+pub fn read_wav_f32(path: &std::path::Path) -> Result<(Vec<f32>, u32)> {
+    let reader = hound::WavReader::open(path)
+        .with_context(|| format!("failed to open WAV {}", path.display()))?;
+    let spec = reader.spec();
+    let channels = spec.channels.max(1) as usize;
+    let interleaved: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .into_samples::<f32>()
+            .collect::<std::result::Result<_, _>>()
+            .context("failed reading float WAV samples")?,
+        hound::SampleFormat::Int => {
+            let scale = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .into_samples::<i32>()
+                .map(|sample| sample.map(|value| value as f32 / scale))
+                .collect::<std::result::Result<_, _>>()
+                .context("failed reading int WAV samples")?
+        }
+    };
+    let mono = if channels <= 1 {
+        interleaved
+    } else {
+        interleaved
+            .chunks(channels)
+            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+            .collect()
+    };
+    Ok((mono, spec.sample_rate))
+}
+
 /// Energy-based VAD: accumulate while RMS exceeds threshold; flush the utterance
 /// after `silence_ms` of quiet, discarding anything shorter than `min_voice_ms`.
 fn segment_utterances(
@@ -199,6 +231,20 @@ mod tests {
         assert_eq!(reader.spec().sample_rate, 16_000);
         assert_eq!(reader.spec().channels, 1);
         assert_eq!(reader.len(), 4);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_wav_f32_recovers_written_samples() {
+        let path = std::env::temp_dir().join("li-read-wav-test.wav");
+        let original = [0.0f32, 0.5, -0.5, 0.25];
+        write_wav_16le(&path, &original, 24_000).unwrap();
+        let (samples, rate) = read_wav_f32(&path).unwrap();
+        assert_eq!(rate, 24_000);
+        assert_eq!(samples.len(), original.len());
+        for (a, b) in original.iter().zip(samples.iter()) {
+            assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+        }
         let _ = std::fs::remove_file(&path);
     }
 }
