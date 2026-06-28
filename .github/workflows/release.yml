@@ -1,0 +1,90 @@
+name: Release
+
+# Cut a release by pushing a semver tag, e.g.:
+#   git tag v0.1.0 && git push origin v0.1.0
+# A manual run (workflow_dispatch) builds the same artifact without publishing
+# a GitHub Release (useful to smoke-test packaging).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & package (x86_64-linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            clang libclang-dev \
+            libpipewire-0.3-dev libspa-0.2-dev
+
+      - name: Build release binaries
+        run: cargo build --release --features native-audio
+
+      # Version comes from the tag (v0.1.0 -> 0.1.0); on a manual run, fall back
+      # to the version declared in Cargo.toml.
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(cargo metadata --no-deps --format-version 1 \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin)["packages"][0]["version"])')"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${VERSION}"
+
+      - name: Package tarball
+        id: pkg
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          PKG="live-interpreter-${VERSION}-x86_64-linux"
+          mkdir -p "dist/${PKG}/bin"
+          for b in live-interpreter li-control li-mesh li-interpret li-voice-demo; do
+            cp "target/release/${b}" "dist/${PKG}/bin/${b}"
+          done
+          cp -r scripts static docs README.md CLAUDE.md "dist/${PKG}/"
+          tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
+          ( cd dist && sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256" )
+          echo "pkg=${PKG}" >> "$GITHUB_OUTPUT"
+          ls -lh dist
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.pkg }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256

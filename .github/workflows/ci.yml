@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "refactor/**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  check:
+    name: clippy + test + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # whisper-rs compiles whisper.cpp (needs a C/C++ toolchain + cmake);
+      # the `native-audio` feature pulls the `pipewire` crate, whose -sys build
+      # runs bindgen (needs libclang) against the PipeWire/SPA dev headers.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            clang libclang-dev \
+            libpipewire-0.3-dev libspa-0.2-dev
+
+      # Lint every target (bins, tests, benches) with the full feature surface.
+      - name: Clippy (all targets, native-audio, deny warnings)
+        run: cargo clippy --all-targets --features native-audio -- -D warnings
+
+      # Library unit tests run headless with no GPU, model, or services
+      # (default features — no PipeWire daemon required).
+      - name: Test (lib)
+        run: cargo test --lib
+
+      # Compile every release binary (server + control + mesh + interpret + voice demo).
+      - name: Build release binaries
+        run: cargo build --release --features native-audio
