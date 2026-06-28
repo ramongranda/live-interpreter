@@ -1,13 +1,13 @@
 //! `LiveRuntime`: in-process Tokio node runtime + lifecycle supervisor.
 //!
-//! Supervises the whole node, not just external services. Replaces the Bash
-//! stack orchestration (`start-local-stack.sh`) and the `data/logs/*.pid` files.
-//! As the Candle-native migration lands, the managed *processes* shrink to the
-//! one remaining external child (the Qwen3-TTS cloning service) while ASR /
-//! translate / voice-render / audio / mesh become in-process Tokio tasks shut
-//! down cooperatively through the runtime `CancellationToken`. Today it still
-//! owns its managed children as `tokio::process::Child` handles and tracks
-//! liveness in memory via `/proc` on their pids.
+//! Supervises the whole node, not just external services. Replaces the old Bash
+//! stack orchestration and the `data/logs/*.pid` files. The long-term direction
+//! is for the managed *processes* to shrink to the one remaining external child
+//! (the Qwen3-TTS cloning service) while ASR / translate / voice-render / audio /
+//! mesh become in-process Tokio tasks shut down cooperatively through the runtime
+//! `CancellationToken`. Today it still owns its managed children as
+//! `tokio::process::Child` handles and tracks liveness in memory via `/proc` on
+//! their pids.
 //!
 //! Honest scope notes:
 //!   * Owned children die with the supervisor (no `setsid`). This is the
@@ -37,7 +37,7 @@ pub const CLIENT: &str = "live-interpreter-client";
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// One supervised OS process: its display name and the `pgrep -f` pattern used
-/// for adopt-vs-spawn idempotency (mirrors `start-local-stack.sh`).
+/// for adopt-vs-spawn idempotency.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManagedService {
     QwenTts,
@@ -56,8 +56,8 @@ impl ManagedService {
         }
     }
 
-    /// Regex for `pgrep -f`. Word-boundary anchors avoid `live-interpreter`
-    /// matching `live-interpreter-client`/`-control`/`-desktop`.
+    /// Regex for `pgrep -f`. Word-boundary anchors keep the `Server` pattern
+    /// (`live-interpreter`) from also matching the `live-interpreter-client` bin.
     pub fn pgrep_pattern(self) -> &'static str {
         match self {
             ManagedService::QwenTts => "api_server_gpu_torch212",

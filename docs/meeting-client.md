@@ -1,9 +1,9 @@
 # Live Interpreter Client
 
-Cliente Rust para usar el servidor GPU desde otro ordenador. La entrada
-recomendada es `live-interpreter-control`; este binario es el motor interno del modo cliente.
-
-Ver tambien `docs/control-panel.md`.
+Cliente Rust para usar el servidor GPU desde otro ordenador. El binario es
+`live-interpreter-client`: captura el micro local, lo envia al servidor por
+WebSocket (`/v1/stream/meeting`) y reproduce la voz traducida hacia el micro
+virtual.
 
 ## Servidor GPU
 
@@ -11,7 +11,9 @@ En la maquina con NVIDIA:
 
 ```bash
 cd /home/rgranda/workspaces/live-interpreter
-LI_BIND=0.0.0.0:8787 ./scripts/start-local-stack.sh
+LI_BIND=0.0.0.0:8787 \
+LI_WHISPER_MODEL=data/models/ggml-large-v3-turbo.bin \
+  ./target/release/live-interpreter
 hostname -I
 ```
 
@@ -40,11 +42,9 @@ Controles disponibles:
 
 ## Salida hacia la app de llamadas
 
-En Linux, crear antes el micro virtual:
-
-```bash
-./scripts/create-virtual-mic.sh
-```
+El micro virtual `live-interpreter-mic-source` lo crea el runtime nativo (los
+binarios compilados con la feature `native-audio`). El cliente reproduce por
+`pw-play` hacia `LI_CLIENT_PLAY_TARGET` (por defecto `live-interpreter-mic-sink`).
 
 En tu app de llamada, reunion o streaming, seleccionar como microfono:
 

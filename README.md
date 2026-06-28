@@ -169,8 +169,6 @@ publishes a versioned `x86_64-linux` tarball (with SHA-256) as a GitHub Release.
 
 ## Documentation
 
-- [docs/native-desktop.md](docs/native-desktop.md) — adapter boundary.
-- [docs/control-panel.md](docs/control-panel.md) — control panel.
 - [docs/meeting-client.md](docs/meeting-client.md) — client runtime and VAD tuning.
 - [docs/qwen3-tts-contract.md](docs/qwen3-tts-contract.md) — TTS HTTP contract.
 - [docs/rust-native-inference.md](docs/rust-native-inference.md) — native inference notes.

@@ -1,8 +1,6 @@
-//! Time-to-first-token benchmark for the active translation backend.
+//! Time-to-first-token benchmark for the Ollama HTTP translation backend.
 //!
-//! Select the backend with env before running:
-//!   LI_TRANSLATE_BACKEND=http  cargo bench --bench translate_latency
-//!   LI_TRANSLATE_BACKEND=candle cargo bench --features translate-candle --bench translate_latency
+//!   cargo bench --bench translate_latency
 //!
 //! `iter_custom` times only up to the first streamed item (first token), then drains the rest so
 //! the model finishes cleanly. LLM calls are slow and non-deterministic, hence small sample size.
