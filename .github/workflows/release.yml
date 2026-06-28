@@ -2,8 +2,8 @@ name: Release
 
 # Cut a release by pushing a semver tag, e.g.:
 #   git tag v0.1.0 && git push origin v0.1.0
-# A manual run (workflow_dispatch) builds the same artifact without publishing
-# a GitHub Release (useful to smoke-test packaging).
+# A manual run (workflow_dispatch) builds and packages both platforms without
+# publishing a GitHub Release (useful to smoke-test packaging).
 on:
   push:
     tags: ["v*"]
@@ -22,8 +22,22 @@ permissions:
 
 jobs:
   build:
-    name: Build & package (x86_64-linux)
-    runs-on: ubuntu-latest
+    name: Build & package (${{ matrix.slug }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux gets every binary: the native-audio feature (in-process
+          # PipeWire virtual mic) is Linux-only.
+          - os: ubuntu-latest
+            slug: x86_64-linux
+            features: native-audio
+          # Windows builds the cross-platform binaries only (server, control
+          # panel, meeting client, ws-smoke). native-audio/PipeWire is skipped.
+          - os: windows-latest
+            slug: x86_64-windows
+            features: ""
     steps:
       - uses: actions/checkout@v5
 
@@ -31,7 +45,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install system dependencies
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -40,52 +55,94 @@ jobs:
             libasound2-dev \
             libpipewire-0.3-dev libspa-0.2-dev
 
-      - name: Build release binaries
-        run: cargo build --release --features native-audio
+      # whisper-rs-sys runs bindgen, which needs libclang. The windows-latest
+      # image ships LLVM under "C:\Program Files\LLVM".
+      - name: Configure Windows toolchain
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
 
-      # Version comes from the tag (v0.1.0 -> 0.1.0); on a manual run, fall back
-      # to the version declared in Cargo.toml.
+      - name: Build release binaries
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo build --release --features "${{ matrix.features }}"
+          else
+            cargo build --release
+          fi
+
       - name: Resolve version
         id: ver
+        shell: bash
         run: |
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
-            VERSION="$(cargo metadata --no-deps --format-version 1 \
-              | python3 -c 'import sys,json;print(json.load(sys.stdin)["packages"][0]["version"])')"
+            VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Resolved version: ${VERSION}"
 
-      - name: Package tarball
-        id: pkg
+      - name: Package tarball (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
           VERSION="${{ steps.ver.outputs.version }}"
-          PKG="live-interpreter-${VERSION}-x86_64-linux"
+          PKG="live-interpreter-${VERSION}-${{ matrix.slug }}"
           mkdir -p "dist/${PKG}/bin"
-          for b in live-interpreter li-control li-mesh li-interpret li-voice-demo; do
+          for b in live-interpreter li-control li-interpret li-mesh li-voice-demo \
+                   live-interpreter-client live-interpreter-ws-smoke; do
             cp "target/release/${b}" "dist/${PKG}/bin/${b}"
           done
           cp -r scripts static docs README.md CLAUDE.md "dist/${PKG}/"
           tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
           ( cd dist && sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256" )
-          echo "pkg=${PKG}" >> "$GITHUB_OUTPUT"
           ls -lh dist
+
+      - name: Package zip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $VERSION = "${{ steps.ver.outputs.version }}"
+          $PKG = "live-interpreter-$VERSION-${{ matrix.slug }}"
+          New-Item -ItemType Directory -Force -Path "dist/$PKG/bin" | Out-Null
+          foreach ($b in "live-interpreter","li-control","live-interpreter-client","live-interpreter-ws-smoke") {
+            Copy-Item "target/release/$b.exe" "dist/$PKG/bin/$b.exe"
+          }
+          Copy-Item -Recurse scripts,static,docs "dist/$PKG/"
+          Copy-Item README.md,CLAUDE.md "dist/$PKG/"
+          Compress-Archive -Path "dist/$PKG" -DestinationPath "dist/$PKG.zip"
+          $hash = (Get-FileHash "dist/$PKG.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $PKG.zip" | Out-File -Encoding ascii -NoNewline "dist/$PKG.zip.sha256"
+          Get-ChildItem dist
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.pkg.outputs.pkg }}
+          name: live-interpreter-${{ steps.ver.outputs.version }}-${{ matrix.slug }}
           path: |
             dist/*.tar.gz
+            dist/*.zip
             dist/*.sha256
           if-no-files-found: error
 
-      - name: Publish GitHub Release
-        if: github.ref_type == 'tag'
+  release:
+    name: Publish GitHub Release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/*.sha256
