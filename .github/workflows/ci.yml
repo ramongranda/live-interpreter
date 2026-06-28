@@ -38,14 +38,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # whisper-rs compiles whisper.cpp (needs a C/C++ toolchain + cmake);
-      # the `native-audio` feature pulls the `pipewire` crate, whose -sys build
-      # runs bindgen (needs libclang) against the PipeWire/SPA dev headers.
+      # cpal links ALSA on Linux (alsa-sys -> libasound2-dev); the `native-audio`
+      # feature pulls the `pipewire` crate, whose -sys build runs bindgen
+      # (needs libclang) against the PipeWire/SPA dev headers.
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config \
             clang libclang-dev \
+            libasound2-dev \
             libpipewire-0.3-dev libspa-0.2-dev
 
       # Lint every target (bins, tests, benches) with the full feature surface.
