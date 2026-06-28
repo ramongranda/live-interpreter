@@ -17,12 +17,7 @@ use live_interpreter::types::{
     Direction, HealthResponse, InterpretResponse, StreamEvent, StreamStart, TextInterpretRequest,
 };
 use live_interpreter::{asr::AsrEngine, config::Config, tts::TtsEngine};
-use std::{
-    collections::HashMap,
-    path::{Path as FsPath, PathBuf},
-    sync::Arc,
-    time::Instant,
-};
+use std::{collections::HashMap, path::Path as FsPath, sync::Arc, time::Instant};
 use thiserror::Error;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use uuid::Uuid;
@@ -93,7 +88,7 @@ async fn interpret_text(
         direction: request.direction,
         transcript: request.text,
         translation,
-        audio_url: audio_path.as_ref().and_then(audio_url),
+        audio_url: audio_path.as_deref().and_then(audio_url),
         audio_path,
     }))
 }
@@ -326,7 +321,7 @@ async fn process_stream_audio(
         state.clone(),
         id,
         &audio_path,
-        start.direction.clone(),
+        start.direction,
         start.synthesize,
     )
     .await?;
@@ -363,7 +358,7 @@ async fn process_audio_path(
         direction,
         transcript,
         translation,
-        audio_url: generated_audio.as_ref().and_then(audio_url),
+        audio_url: generated_audio.as_deref().and_then(audio_url),
         audio_path: generated_audio,
     })
 }
@@ -416,7 +411,7 @@ fn require_auth(
     }
 }
 
-async fn persist_response(data_dir: &PathBuf, response: &InterpretResponse) -> anyhow::Result<()> {
+async fn persist_response(data_dir: &FsPath, response: &InterpretResponse) -> anyhow::Result<()> {
     let dir = data_dir.join("transcripts");
     tokio::fs::create_dir_all(&dir).await?;
     let path = dir.join(format!("{}.json", response.id));
@@ -438,7 +433,7 @@ pub(crate) fn safe_filename(value: &str) -> String {
         .collect()
 }
 
-fn audio_url(path: &PathBuf) -> Option<String> {
+fn audio_url(path: &FsPath) -> Option<String> {
     let filename = path.file_name()?.to_str()?;
     Some(format!("/v1/audio/{}", safe_filename(filename)))
 }

@@ -284,10 +284,10 @@ impl LiveRuntime {
         let name = service.name();
         let mut map = self.children.lock().await;
 
-        if let Some(existing) = map.get(name) {
-            if pid_alive(existing.pid) {
-                return Ok(format!("{name} ya esta arrancado"));
-            }
+        if let Some(existing) = map.get(name)
+            && pid_alive(existing.pid)
+        {
+            return Ok(format!("{name} ya esta arrancado"));
         }
         if let Some(pid) = pgrep(service.pgrep_pattern()).await {
             map.insert(
@@ -672,7 +672,7 @@ mod tests {
         }
         let tracked = sup.stop_child(SERVER, Duration::from_millis(50)).await;
         assert!(tracked, "adopted entry was tracked");
-        assert!(sup.liveness().await.server == false, "no longer tracked");
+        assert!(!sup.liveness().await.server, "no longer tracked");
         assert!(pid_alive(std::process::id()), "adopted process not killed");
     }
 }

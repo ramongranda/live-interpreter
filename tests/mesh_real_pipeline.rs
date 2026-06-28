@@ -19,7 +19,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
 use chrono::{DateTime, Utc};
 use live_interpreter::asr::AsrEngine;
 use live_interpreter::capture::read_wav_f32;

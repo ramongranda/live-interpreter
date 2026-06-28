@@ -78,7 +78,7 @@ pub fn nvml_snapshot() -> Result<VramSnapshot> {
         entry.used_mb = entry.used_mb.max(used_mb);
     }
     let mut processes: Vec<GpuProcessMem> = by_pid.into_values().collect();
-    processes.sort_by(|a, b| b.used_mb.cmp(&a.used_mb));
+    processes.sort_by_key(|p| std::cmp::Reverse(p.used_mb));
 
     let utilization_pct = device
         .utilization_rates()
@@ -146,7 +146,7 @@ async fn nvidia_smi_snapshot() -> Result<VramSnapshot> {
             })
         })
         .collect();
-    processes.sort_by(|a, b| b.used_mb.cmp(&a.used_mb));
+    processes.sort_by_key(|p| std::cmp::Reverse(p.used_mb));
 
     Ok(VramSnapshot {
         device_name,
@@ -199,7 +199,7 @@ pub fn evaluate_preflight(snapshot: &VramSnapshot, min_vram_mb: u64) -> GpuPrefl
 /// Semantic error naming which processes are holding the VRAM.
 fn retention_message(snapshot: &VramSnapshot, min_vram_mb: u64) -> String {
     let mut holders = snapshot.processes.clone();
-    holders.sort_by(|a, b| b.used_mb.cmp(&a.used_mb));
+    holders.sort_by_key(|p| std::cmp::Reverse(p.used_mb));
     let listed = holders
         .iter()
         .take(3)

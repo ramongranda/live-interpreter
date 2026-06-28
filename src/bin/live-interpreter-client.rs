@@ -321,11 +321,10 @@ fn run_audio_capture(app: App) -> anyhow::Result<()> {
             silence = 0;
             voiced = 0;
 
-            if speech.len() >= min_voice_samples {
-                if let Err(error) = rt.block_on(process_utterance(app.clone(), speech, sample_rate))
-                {
-                    set_error(&app, error);
-                }
+            if speech.len() >= min_voice_samples
+                && let Err(error) = rt.block_on(process_utterance(app.clone(), speech, sample_rate))
+            {
+                set_error(&app, error);
             }
             update_status(&app, "listening");
         }
