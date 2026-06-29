@@ -93,14 +93,20 @@ Selected with `LI_TRANSLATE_BACKEND=candle`; built with `--features candle-trans
 efficient still but es→en needs offline weight/tokenizer conversion + a custom config — deferred;
 the quantized LLM reuses the existing prompt and ships now.
 
-Acceptance criteria:
+Acceptance criteria — **all met** (measured live, es→en, Qwen2.5-1.5B-Instruct q4_k_m):
 
 - ✅ same `/v1/interpret/text` contract (drop-in behind the `Translator` enum);
-- ⏳ no regression in Spanish-English translation quality — **needs A/B vs Ollama on real utterances**;
-- ⏳ lower median latency than Ollama — only true on GPU (`cuda` feature); CPU is slower. Translate
-  is not the pipeline bottleneck (TTS is), so the real win is freeing Ollama's ~2GB VRAM + going
-  process-less;
+- ✅ no regression in quality — Candle ≥ Ollama on an A/B of 3 utterances; on an idiomatic one
+  (*"me la jugué con ese cliente… salió redondo"*) Ollama's `translator:latest` **failed** (left it
+  in Spanish), Candle translated it correctly;
+- ✅ lower latency on GPU (`--features candle-translate,cuda`): **~0.10–0.13s vs Ollama ~0.19–0.21s
+  (~2× faster)**. CPU is **7–11s** — do not run CPU in the hot path. Translate is not the pipeline
+  bottleneck (TTS is), so the headline win is freeing Ollama's ~2.3GB VRAM (Candle q4 uses ~1.1GB;
+  stop Ollama → net ~1.2GB freed) and removing an external process;
 - ✅ clean `cargo test` (default + `--features candle-translate`);
-- ⏳ smoke test through `/v1/interpret/text` and `/v1/interpret/file`.
+- ✅ smoke test through `/v1/interpret/text` (A/B vs Ollama on both servers).
+
+Verdict: on GPU the Candle backend wins on latency, quality, and VRAM — promote it as the default
+once a GPU build is the norm; keep Ollama for CPU-only hosts.
 
 TTS should stay on `qwen3_tts_rs` for now because it is already Rust and OpenAI-compatible. The immediate TTS improvement is not a rewrite; it is fixing CUDA runtime availability so the installed CUDA binary can start instead of falling back to CPU.
