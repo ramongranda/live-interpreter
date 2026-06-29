@@ -109,4 +109,30 @@ Acceptance criteria — **all met** (measured live, es→en, Qwen2.5-1.5B-Instru
 Verdict: on GPU the Candle backend wins on latency, quality, and VRAM — promote it as the default
 once a GPU build is the norm; keep Ollama for CPU-only hosts.
 
+## Promotion + model choice + Marian decision
+
+**Default backend (shipped).** `Translator::from_env` now auto-selects Candle when the binary was
+built with `candle-translate` **and** the GGUF model is present (`resolve_backend`, pure + tested);
+`LI_TRANSLATE_BACKEND` still overrides. So a GPU build with the model downloaded uses Candle with no
+config; everything else falls back to Ollama. No footgun on non-candle builds.
+
+**Model size A/B (es→en, GPU, q4_k_m).** Qwen2.5 **0.5B** vs **1.5B**:
+
+| | 0.5B | 1.5B |
+|---|---|---|
+| latency | ~0.13s | ~0.10s |
+| VRAM | ~0.5GB | ~1.1GB |
+| quality | good on plain sentences; idiom *"me la jugué"* → "I played with" (wrong) | slightly better nuance; idiom → "I lost it" (closer) |
+
+Latency is effectively tied (both <150ms, both beat Ollama). **Default stays 1.5B** for the quality
+edge; 0.5B is the low-VRAM option via `LI_CANDLE_TRANSLATE_GGUF`.
+
+**Dedicated NMT (Marian/Opus-MT): not pursued — YAGNI, evidence-backed.** A dedicated es↔en NMT would
+save ~0.8GB more VRAM, but: (1) translate is already ~0.1s — negligible next to TTS ~2.5s, the real
+bottleneck, so there is no latency to win; (2) the instruct LLM already matches/beats Ollama and
+handles conversational context (`TranslationBuffer`), where a dedicated NMT tends to be more literal;
+(3) es→en is not a Candle preset, needing offline pytorch→safetensors + tokenizer conversion and a
+custom config. Cost is real, payoff is a VRAM saving that does not move the pipeline. Revisit only if
+a future host is VRAM-starved enough that ~0.8GB matters.
+
 TTS should stay on `qwen3_tts_rs` for now because it is already Rust and OpenAI-compatible. The immediate TTS improvement is not a rewrite; it is fixing CUDA runtime availability so the installed CUDA binary can start instead of falling back to CPU.

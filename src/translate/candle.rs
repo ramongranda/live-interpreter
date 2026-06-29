@@ -47,7 +47,7 @@ impl CandleTranslator {
     /// `_TOKENIZER`). Fetch them with `scripts/download-translate-model.sh`.
     pub fn from_env() -> Result<Self> {
         let gguf_path = std::env::var("LI_CANDLE_TRANSLATE_GGUF")
-            .unwrap_or_else(|_| "data/models/translate/qwen2.5-1.5b-instruct-q4_k_m.gguf".into());
+            .unwrap_or_else(|_| super::DEFAULT_CANDLE_GGUF.to_string());
         let tokenizer_path = std::env::var("LI_CANDLE_TRANSLATE_TOKENIZER")
             .unwrap_or_else(|_| "data/models/translate/tokenizer.json".into());
         let max_new_tokens = std::env::var("LI_CANDLE_TRANSLATE_MAX_TOKENS")

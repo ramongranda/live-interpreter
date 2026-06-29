@@ -136,12 +136,20 @@ pub enum Translator {
 }
 
 impl Translator {
-    /// Pick the backend from `LI_TRANSLATE_BACKEND` (`ollama` default, `candle`
-    /// for the in-process Qwen2 GGUF). `candle` requires the `candle-translate`
-    /// feature; the Ollama args are ignored by that backend.
+    /// Pick the backend. `LI_TRANSLATE_BACKEND` (`candle`/`ollama`) wins when
+    /// set; otherwise default to the in-process Candle backend **iff** this was
+    /// built with `candle-translate` and the GGUF model is present — so a GPU
+    /// build with the model downloaded uses Candle automatically (faster, frees
+    /// Ollama's VRAM), while every other configuration falls back to Ollama.
+    /// `candle` requires the feature; the Ollama args are ignored by that backend.
     pub fn from_env(ollama_url: String, ollama_model: String) -> Result<Self> {
-        let backend = std::env::var("LI_TRANSLATE_BACKEND").unwrap_or_else(|_| "ollama".into());
-        match backend.as_str() {
+        let requested = std::env::var("LI_TRANSLATE_BACKEND").ok();
+        let backend = resolve_backend(
+            requested.as_deref(),
+            cfg!(feature = "candle-translate"),
+            candle_model_present(),
+        );
+        match backend {
             #[cfg(feature = "candle-translate")]
             "candle" => Ok(Self::Candle(CandleTranslator::from_env()?)),
             #[cfg(not(feature = "candle-translate"))]
@@ -175,6 +183,32 @@ impl Translator {
             Self::Candle(t) => t.translate_stream(text, direction).await,
         }
     }
+}
+
+/// Default GGUF path for the Candle backend (override with `LI_CANDLE_TRANSLATE_GGUF`).
+pub(crate) const DEFAULT_CANDLE_GGUF: &str =
+    "data/models/translate/qwen2.5-1.5b-instruct-q4_k_m.gguf";
+
+/// Pure backend choice: an explicit `LI_TRANSLATE_BACKEND` wins; otherwise
+/// prefer Candle only when both the feature is compiled in and the model is
+/// present, else Ollama.
+fn resolve_backend(
+    requested: Option<&str>,
+    candle_feature: bool,
+    model_present: bool,
+) -> &'static str {
+    match requested {
+        Some("candle") => "candle",
+        Some("ollama") => "ollama",
+        _ if candle_feature && model_present => "candle",
+        _ => "ollama",
+    }
+}
+
+fn candle_model_present() -> bool {
+    let path = std::env::var("LI_CANDLE_TRANSLATE_GGUF")
+        .unwrap_or_else(|_| DEFAULT_CANDLE_GGUF.to_string());
+    std::path::Path::new(&path).exists()
 }
 
 /// Shared instruction prompt. Kept identical to the original `translate.rs` so server output does
@@ -220,10 +254,31 @@ pub(crate) fn strip_think(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        TranslationBuffer, TranslationBufferConfig, TranslationTurn, clamp_chars, strip_think,
+        TranslationBuffer, TranslationBufferConfig, TranslationTurn, clamp_chars, resolve_backend,
+        strip_think,
     };
     use crate::types::Direction;
     use std::time::Duration;
+
+    #[test]
+    fn resolve_backend_respects_explicit_request() {
+        assert_eq!(resolve_backend(Some("candle"), false, false), "candle");
+        assert_eq!(resolve_backend(Some("ollama"), true, true), "ollama");
+    }
+
+    #[test]
+    fn resolve_backend_auto_prefers_candle_only_with_feature_and_model() {
+        assert_eq!(resolve_backend(None, true, true), "candle");
+        assert_eq!(resolve_backend(None, true, false), "ollama");
+        assert_eq!(resolve_backend(None, false, true), "ollama");
+        assert_eq!(resolve_backend(None, false, false), "ollama");
+    }
+
+    #[test]
+    fn resolve_backend_unknown_value_falls_back_to_auto() {
+        assert_eq!(resolve_backend(Some("bogus"), true, true), "candle");
+        assert_eq!(resolve_backend(Some("bogus"), false, false), "ollama");
+    }
 
     #[test]
     fn strips_complete_think_blocks() {
