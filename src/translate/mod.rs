@@ -161,6 +161,12 @@ impl Translator {
     }
 
     pub async fn translate(&self, text: &str, direction: &Direction) -> Result<String> {
+        // Blank input (e.g. ASR found no speech) must not reach a backend: with
+        // recent turns in the system prompt the LLM echoes a stale translation
+        // instead of returning nothing. Short-circuit to empty.
+        if text.trim().is_empty() {
+            return Ok(String::new());
+        }
         match self {
             Self::Http(t) => t.translate(text, direction).await,
             #[cfg(feature = "candle-translate")]
@@ -257,11 +263,20 @@ pub(crate) fn strip_think(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        TranslationBuffer, TranslationBufferConfig, TranslationTurn, clamp_chars, resolve_backend,
-        strip_think,
+        HttpTranslator, TranslationBuffer, TranslationBufferConfig, TranslationTurn, Translator,
+        clamp_chars, resolve_backend, strip_think,
     };
     use crate::types::Direction;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn translate_blank_input_returns_empty_without_backend_call() {
+        // Unreachable backend on purpose: only the blank-input short-circuit
+        // lets these resolve to Ok("") instead of a connection error.
+        let t = Translator::Http(HttpTranslator::new("http://127.0.0.1:9".into(), "x".into()));
+        assert_eq!(t.translate("   ", &Direction::EsToEn).await.unwrap(), "");
+        assert_eq!(t.translate("", &Direction::EnToEs).await.unwrap(), "");
+    }
 
     #[test]
     fn resolve_backend_respects_explicit_request() {
