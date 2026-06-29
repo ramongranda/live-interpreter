@@ -248,14 +248,26 @@ pub fn split_clauses(text: &str) -> Vec<String> {
     // MAX_CHARS the first chunk takes too long, so force a word-boundary break.
     const MIN_SOFT_CHARS: usize = 24;
     const MAX_CHARS: usize = 72;
+    // The FIRST clause alone gates time-to-first-audio (the conversational
+    // latency), so split it at the first soft separator (e.g. an opening
+    // "Hello,") even when short — one extra ~1s TTS call buys the first audio
+    // sooner. Later clauses keep MIN_SOFT_CHARS since they synthesize while the
+    // first one is already playing. Max stays uniform to avoid unnatural
+    // mid-sentence breaks on the opening.
+    const FIRST_SOFT_CHARS: usize = 6;
 
     let mut clauses = Vec::new();
     let mut current = String::new();
     for ch in text.chars() {
         current.push(ch);
         let len = current.trim().chars().count();
+        let soft_min = if clauses.is_empty() {
+            FIRST_SOFT_CHARS
+        } else {
+            MIN_SOFT_CHARS
+        };
         let hard = matches!(ch, '.' | '!' | '?' | ';' | '…');
-        let soft = matches!(ch, ',' | ':' | '—') && len >= MIN_SOFT_CHARS;
+        let soft = matches!(ch, ',' | ':' | '—') && len >= soft_min;
         let too_long = len >= MAX_CHARS && ch.is_whitespace();
         if hard || soft || too_long {
             let trimmed = current.trim();
@@ -401,6 +413,16 @@ mod tests {
         assert_eq!(
             split_clauses("Hola, bienvenido."),
             vec!["Hola, bienvenido."]
+        );
+    }
+
+    #[test]
+    fn split_clauses_first_clause_splits_on_early_comma_for_low_ttfa() {
+        // The opening "Hello," (>=6 chars) becomes its own chunk so the first
+        // audio lands ASAP; later clauses keep the larger MIN_SOFT_CHARS sizing.
+        assert_eq!(
+            split_clauses("Hello, good morning to all. Let us begin."),
+            vec!["Hello,", "good morning to all.", "Let us begin."]
         );
     }
 
