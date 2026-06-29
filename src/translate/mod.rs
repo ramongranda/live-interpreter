@@ -2,10 +2,14 @@
 //!
 //! The server only needs `translate(text, direction) -> String`. We keep that surface concrete
 //! (an enum, not `dyn`) so `AppState` stays `Clone` and we avoid an `async-trait` dependency in a
-//! codebase that otherwise uses native `async fn` in traits. Two backends:
+//! codebase that otherwise uses native `async fn` in traits. Backends:
 //!
-//! Single backend [`HttpTranslator`]: the Ollama HTTP client. `translate_stream` yields the full
-//! translation as one chunk (non-streaming), used by `benches/translate_latency.rs`.
+//! - [`HttpTranslator`]: the Ollama HTTP client (default).
+//! - [`CandleTranslator`] (feature `candle-translate`): in-process quantized Qwen2 GGUF — no
+//!   external Ollama process, frees its VRAM. Selected with `LI_TRANSLATE_BACKEND=candle`.
+//!
+//! `translate_stream` yields the full translation as one chunk (non-streaming) on both backends,
+//! used by `benches/translate_latency.rs`.
 
 use crate::types::Direction;
 use anyhow::Result;
@@ -15,6 +19,11 @@ use std::{collections::VecDeque, pin::Pin, time::Duration};
 
 mod http;
 pub use http::HttpTranslator;
+
+#[cfg(feature = "candle-translate")]
+mod candle;
+#[cfg(feature = "candle-translate")]
+pub use candle::CandleTranslator;
 
 /// Boxed token stream. First `.next().await` marks time-to-first-token.
 pub type TokenStream = Pin<Box<dyn Stream<Item = Result<String>> + Send>>;
@@ -117,26 +126,54 @@ impl TranslationBuffer {
     }
 }
 
-/// Translation backend: the Ollama HTTP client.
+/// Translation backend. Ollama HTTP by default; an in-process Candle Qwen2
+/// backend when built with `candle-translate` and `LI_TRANSLATE_BACKEND=candle`.
 #[derive(Clone)]
-pub struct Translator(HttpTranslator);
+pub enum Translator {
+    Http(HttpTranslator),
+    #[cfg(feature = "candle-translate")]
+    Candle(CandleTranslator),
+}
 
 impl Translator {
-    /// Build the Ollama HTTP translator.
+    /// Pick the backend from `LI_TRANSLATE_BACKEND` (`ollama` default, `candle`
+    /// for the in-process Qwen2 GGUF). `candle` requires the `candle-translate`
+    /// feature; the Ollama args are ignored by that backend.
     pub fn from_env(ollama_url: String, ollama_model: String) -> Result<Self> {
-        Ok(Self(HttpTranslator::new(ollama_url, ollama_model)))
+        let backend = std::env::var("LI_TRANSLATE_BACKEND").unwrap_or_else(|_| "ollama".into());
+        match backend.as_str() {
+            #[cfg(feature = "candle-translate")]
+            "candle" => Ok(Self::Candle(CandleTranslator::from_env()?)),
+            #[cfg(not(feature = "candle-translate"))]
+            "candle" => anyhow::bail!(
+                "LI_TRANSLATE_BACKEND=candle requires building with --features candle-translate"
+            ),
+            _ => Ok(Self::Http(HttpTranslator::new(ollama_url, ollama_model))),
+        }
     }
 
     pub async fn translate(&self, text: &str, direction: &Direction) -> Result<String> {
-        self.0.translate(text, direction).await
+        match self {
+            Self::Http(t) => t.translate(text, direction).await,
+            #[cfg(feature = "candle-translate")]
+            Self::Candle(t) => t.translate(text, direction).await,
+        }
     }
 
     pub async fn observe_silence(&self, silence: Duration) {
-        self.0.observe_silence(silence).await
+        match self {
+            Self::Http(t) => t.observe_silence(silence).await,
+            #[cfg(feature = "candle-translate")]
+            Self::Candle(t) => t.observe_silence(silence).await,
+        }
     }
 
     pub async fn translate_stream(&self, text: &str, direction: &Direction) -> Result<TokenStream> {
-        self.0.translate_stream(text, direction).await
+        match self {
+            Self::Http(t) => t.translate_stream(text, direction).await,
+            #[cfg(feature = "candle-translate")]
+            Self::Candle(t) => t.translate_stream(text, direction).await,
+        }
     }
 }
 

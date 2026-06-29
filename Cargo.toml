@@ -33,14 +33,25 @@ pipewire = { version = "0.8", optional = true }
 # Real-time NVIDIA VRAM telemetry. Loads libnvidia-ml.so at runtime (libloading); no build-time CUDA dep.
 nvml-wrapper = "0.12"
 
+# In-process quantized-LLM translation backend (Candle). Optional: heavy to compile, so the
+# default build stays on the Ollama HTTP backend. Behind the `candle-translate` feature.
+# GPU comes from the `cuda` feature via weak-dep activation (candle-core?/cuda) — needs nvcc.
+candle-core = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", optional = true }
+tokenizers = { version = "0.23", optional = true }
+
 [dev-dependencies]
 criterion = "0.5"
 
 [features]
 default = []
-cuda = ["whisper-rs/cuda"]
+# GPU for Whisper (whisper-rs) and, when `candle-translate` is also on, for the
+# Candle translation backend (weak-dep activation — only if candle-core is built).
+cuda = ["whisper-rs/cuda", "candle-core?/cuda", "candle-transformers?/cuda"]
 # Native in-process PipeWire virtual microphone (replaces pw-loopback).
 native-audio = ["dep:pipewire"]
+# In-process quantized-LLM translation (Qwen2 GGUF via Candle) instead of Ollama.
+candle-translate = ["dep:candle-core", "dep:candle-transformers", "dep:tokenizers"]
 
 [[bench]]
 name = "translate_latency"
