@@ -12,9 +12,11 @@ use axum::{
 };
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
+use live_interpreter::events::EventHub;
 use live_interpreter::translate::Translator;
 use live_interpreter::types::{
-    Direction, HealthResponse, InterpretResponse, StreamEvent, StreamStart, TextInterpretRequest,
+    Direction, HealthResponse, InterpretResponse, Lane, PipelineEvent, SessionStart,
+    TextInterpretRequest,
 };
 use live_interpreter::{asr::AsrEngine, config::Config, tts::TtsEngine};
 use std::{collections::HashMap, path::Path as FsPath, sync::Arc, time::Instant};
@@ -160,13 +162,27 @@ async fn meeting_stream(
 }
 
 async fn handle_meeting_stream(socket: WebSocket, state: AppState) {
-    let (mut sender, mut receiver) = socket.split();
+    let (mut sink, mut receiver) = socket.split();
 
-    if send_event(&mut sender, &StreamEvent::Ready).await.is_err() {
-        return;
-    }
+    // Symmetric `PipelineEvent` contract: every event is fanned out by the
+    // session `EventHub` and forwarded to the socket as one bincode frame
+    // (the `AudioFrame` carries its PCM inline — no separate binary frame).
+    let hub = EventHub::new(Uuid::new_v4(), 64);
+    let mut rx = hub.subscribe();
+    let forward = tokio::spawn(async move {
+        while let Ok(envelope) = rx.recv().await {
+            let Ok(bytes) = bincode::serialize(&envelope) else {
+                break;
+            };
+            if sink.send(Message::Binary(bytes.into())).await.is_err() {
+                break;
+            }
+        }
+    });
 
-    let mut start = StreamStart {
+    hub.publish(PipelineEvent::Ready, now_ms());
+
+    let mut session = SessionStart {
         direction: Direction::EsToEn,
         synthesize: true,
     };
@@ -175,116 +191,108 @@ async fn handle_meeting_stream(socket: WebSocket, state: AppState) {
         let message = match message {
             Ok(message) => message,
             Err(error) => {
-                let _ = send_event(
-                    &mut sender,
-                    &StreamEvent::Error {
+                hub.publish(
+                    PipelineEvent::Error {
                         message: error.to_string(),
                     },
-                )
-                .await;
+                    now_ms(),
+                );
                 break;
             }
         };
 
         match message {
-            Message::Text(text) => match serde_json::from_str::<StreamStart>(&text) {
+            Message::Text(text) => match serde_json::from_str::<SessionStart>(&text) {
                 Ok(value) => {
-                    start = value;
-                    let _ = send_event(&mut sender, &StreamEvent::Listening).await;
+                    session = value;
+                    hub.publish(PipelineEvent::Listening { lane: Lane::Local }, now_ms());
                 }
                 Err(error) => {
-                    let _ = send_event(
-                        &mut sender,
-                        &StreamEvent::Error {
-                            message: format!("invalid stream start message: {error}"),
+                    hub.publish(
+                        PipelineEvent::Error {
+                            message: format!("invalid session start message: {error}"),
                         },
-                    )
-                    .await;
+                        now_ms(),
+                    );
                 }
             },
             Message::Binary(bytes) => {
                 let id = Uuid::new_v4();
                 let started = Instant::now();
-                if send_event(&mut sender, &StreamEvent::Processing { id })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
+                hub.publish(
+                    PipelineEvent::Processing {
+                        id,
+                        lane: Lane::Local,
+                    },
+                    now_ms(),
+                );
 
-                match process_stream_audio(state.clone(), id, &bytes, &start).await {
+                match process_stream_audio(state.clone(), id, &bytes, &session).await {
                     Ok(response) => {
-                        let latency_ms = started.elapsed().as_millis();
-                        if send_event(
-                            &mut sender,
-                            &StreamEvent::TranscriptFinal {
+                        hub.publish(
+                            PipelineEvent::Transcript {
                                 id,
+                                lane: Lane::Local,
+                                lang: session.direction.source(),
                                 text: response.transcript.clone(),
                             },
-                        )
-                        .await
-                        .is_err()
-                        {
-                            return;
-                        }
-                        if send_event(
-                            &mut sender,
-                            &StreamEvent::TranslationFinal {
+                            now_ms(),
+                        );
+                        hub.publish(
+                            PipelineEvent::Translation {
                                 id,
+                                lane: Lane::Local,
+                                lang: session.direction.target(),
                                 text: response.translation.clone(),
                             },
-                        )
-                        .await
-                        .is_err()
-                        {
-                            return;
-                        }
+                            now_ms(),
+                        );
                         if let Some(audio_path) = response.audio_path.as_ref() {
                             match tokio::fs::read(audio_path).await {
-                                Ok(audio) => {
-                                    if send_event(
-                                        &mut sender,
-                                        &StreamEvent::AudioStart {
-                                            id,
-                                            content_type: "audio/wav".into(),
-                                            bytes: audio.len(),
-                                        },
-                                    )
-                                    .await
-                                    .is_err()
-                                    {
-                                        return;
-                                    }
-                                    if sender.send(Message::Binary(audio.into())).await.is_err() {
-                                        return;
+                                Ok(wav) => {
+                                    match live_interpreter::voice::wav_to_audio_frame(&wav) {
+                                        Ok(frame) => hub.publish(
+                                            PipelineEvent::AudioFrame {
+                                                id,
+                                                lane: Lane::Local,
+                                                spec: frame.spec,
+                                                pcm: frame.pcm,
+                                            },
+                                            now_ms(),
+                                        ),
+                                        Err(error) => hub.publish(
+                                            PipelineEvent::Error {
+                                                message: error.to_string(),
+                                            },
+                                            now_ms(),
+                                        ),
                                     }
                                 }
-                                Err(error) => {
-                                    let _ = send_event(
-                                        &mut sender,
-                                        &StreamEvent::Error {
-                                            message: error.to_string(),
-                                        },
-                                    )
-                                    .await;
-                                }
-                            }
+                                Err(error) => hub.publish(
+                                    PipelineEvent::Error {
+                                        message: error.to_string(),
+                                    },
+                                    now_ms(),
+                                ),
+                            };
                         }
-                        if send_event(&mut sender, &StreamEvent::Done { id, latency_ms })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
+                        let latency_ms = started.elapsed().as_millis() as u64;
+                        hub.publish(
+                            PipelineEvent::Done {
+                                id,
+                                lane: Lane::Local,
+                                latency_ms,
+                            },
+                            now_ms(),
+                        );
                     }
                     Err(error) => {
-                        let _ = send_event(
-                            &mut sender,
-                            &StreamEvent::Error {
+                        hub.publish(
+                            PipelineEvent::Error {
                                 message: error.to_string(),
                             },
-                        )
-                        .await;
+                            now_ms(),
+                        );
                     }
                 }
             }
@@ -292,21 +300,25 @@ async fn handle_meeting_stream(socket: WebSocket, state: AppState) {
             _ => {}
         }
     }
+
+    // Dropping the hub closes the broadcast channel and ends the forward task.
+    drop(hub);
+    let _ = forward.await;
 }
 
-async fn send_event(
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    event: &StreamEvent,
-) -> Result<(), axum::Error> {
-    let body = serde_json::to_string(event).expect("stream event serialization failed");
-    sender.send(Message::Text(body.into())).await
+/// Wall-clock milliseconds since the Unix epoch, for stamping event envelopes.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 async fn process_stream_audio(
     state: AppState,
     id: Uuid,
     audio: &[u8],
-    start: &StreamStart,
+    start: &SessionStart,
 ) -> anyhow::Result<InterpretResponse> {
     let uploads = state.config.data_dir.join("uploads");
     tokio::fs::create_dir_all(&uploads)

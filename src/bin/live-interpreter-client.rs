@@ -11,7 +11,8 @@ use cpal::{
 };
 use futures_util::{SinkExt, StreamExt};
 use hound::{SampleFormat as WavSampleFormat, WavSpec, WavWriter};
-use serde::{Deserialize, Serialize};
+use live_interpreter::types::{AudioSpec, Direction, EventEnvelope, PipelineEvent, SessionStart};
+use serde::Serialize;
 use std::collections::VecDeque;
 use std::{
     env,
@@ -136,50 +137,6 @@ struct ClientState {
     last_translation: String,
     last_audio_url: Option<String>,
     last_error: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Direction {
-    EsToEn,
-    EnToEs,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct StreamStart {
-    direction: Direction,
-    synthesize: bool,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
-#[allow(dead_code)]
-enum StreamEvent {
-    Ready,
-    Listening,
-    Processing {
-        id: String,
-    },
-    TranscriptFinal {
-        id: String,
-        text: String,
-    },
-    TranslationFinal {
-        id: String,
-        text: String,
-    },
-    AudioStart {
-        id: String,
-        content_type: String,
-        bytes: usize,
-    },
-    Done {
-        id: String,
-        latency_ms: u128,
-    },
-    Error {
-        message: String,
-    },
 }
 
 #[tokio::main]
@@ -413,7 +370,7 @@ async fn process_utterance(app: App, samples: Vec<f32>, sample_rate: u32) -> any
     let (mut socket, _) = connect_async(&url)
         .await
         .with_context(|| format!("failed to connect websocket {url}"))?;
-    let start = StreamStart {
+    let start = SessionStart {
         direction: parse_direction(&direction),
         synthesize: true,
     };
@@ -429,33 +386,35 @@ async fn process_utterance(app: App, samples: Vec<f32>, sample_rate: u32) -> any
 
     while let Some(message) = socket.next().await {
         match message? {
-            Message::Text(text) => {
-                let event: StreamEvent = serde_json::from_str(&text)?;
-                match event {
-                    StreamEvent::Ready | StreamEvent::Listening => {}
-                    StreamEvent::Processing { .. } => {
+            Message::Binary(frame) => {
+                let envelope: EventEnvelope =
+                    bincode::deserialize(&frame).context("failed to decode pipeline event")?;
+                match envelope.event {
+                    PipelineEvent::Processing { .. } => {
                         set_status(&app, "processing").await;
                     }
-                    StreamEvent::TranscriptFinal { text, .. } => {
+                    PipelineEvent::Transcript { text, .. } => {
                         transcript = text;
                         update_last_text(&app, &transcript, &translation, audio_url.clone());
                     }
-                    StreamEvent::TranslationFinal { text, .. } => {
+                    PipelineEvent::Translation { text, .. } => {
                         translation = text;
                         update_last_text(&app, &transcript, &translation, audio_url.clone());
                     }
-                    StreamEvent::AudioStart { .. } => {
+                    PipelineEvent::AudioFrame { pcm, spec, .. } => {
                         set_status(&app, "receiving_audio").await;
+                        write_pcm_wav(&out_path, &pcm, spec)?;
+                        audio_url = Some("websocket://last-audio".to_string());
+                        if !app.controls.output_muted.load(Ordering::Relaxed) {
+                            play_audio(&app, &out_path).await?;
+                        }
                     }
-                    StreamEvent::Done { .. } => break,
-                    StreamEvent::Error { message } => bail!(message),
-                }
-            }
-            Message::Binary(audio) => {
-                audio_url = Some("websocket://last-audio".to_string());
-                tokio::fs::write(&out_path, audio).await?;
-                if !app.controls.output_muted.load(Ordering::Relaxed) {
-                    play_audio(&app, &out_path).await?;
+                    PipelineEvent::Done { .. } => break,
+                    PipelineEvent::Error { message } => bail!(message),
+                    PipelineEvent::Ready
+                    | PipelineEvent::Listening { .. }
+                    | PipelineEvent::State(_)
+                    | PipelineEvent::Telemetry(_) => {}
                 }
             }
             Message::Close(_) => break,
@@ -536,6 +495,23 @@ fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> anyhow::Result<(
     for sample in samples {
         let clamped = sample.clamp(-1.0, 1.0);
         writer.write_sample((clamped * i16::MAX as f32) as i16)?;
+    }
+    writer.finalize()?;
+    Ok(())
+}
+
+/// Wrap raw s16le PCM (from a `PipelineEvent::AudioFrame`) back into a WAV file
+/// so the existing `pw-play` path can play it.
+fn write_pcm_wav(path: &Path, pcm: &[u8], spec: AudioSpec) -> anyhow::Result<()> {
+    let wav_spec = WavSpec {
+        channels: spec.channels as u16,
+        sample_rate: spec.sample_rate,
+        bits_per_sample: 16,
+        sample_format: WavSampleFormat::Int,
+    };
+    let mut writer = WavWriter::create(path, wav_spec)?;
+    for frame in pcm.chunks_exact(2) {
+        writer.write_sample(i16::from_le_bytes([frame[0], frame[1]]))?;
     }
     writer.finalize()?;
     Ok(())

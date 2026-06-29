@@ -1,14 +1,8 @@
 use anyhow::{Context, bail};
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use live_interpreter::types::{Direction, EventEnvelope, PipelineEvent, SessionStart};
 use std::{env, path::PathBuf};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-
-#[derive(Serialize)]
-struct StreamStart<'a> {
-    direction: &'a str,
-    synthesize: bool,
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -17,7 +11,13 @@ async fn main() -> anyhow::Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp/live-interpreter-gpu-tts.wav"));
-    let direction = env::var("LI_CLIENT_DIRECTION").unwrap_or_else(|_| "en_to_es".into());
+    let direction = match env::var("LI_CLIENT_DIRECTION")
+        .unwrap_or_else(|_| "en_to_es".into())
+        .as_str()
+    {
+        "es_to_en" => Direction::EsToEn,
+        _ => Direction::EnToEs,
+    };
     let token = env::var("LI_AUTH_TOKEN").ok();
     let url = websocket_url(&server_url, token.as_deref());
     let audio = tokio::fs::read(&audio_path)
@@ -29,8 +29,8 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("failed to connect {url}"))?;
     socket
         .send(Message::Text(
-            serde_json::to_string(&StreamStart {
-                direction: &direction,
+            serde_json::to_string(&SessionStart {
+                direction,
                 synthesize: true,
             })?
             .into(),
@@ -41,18 +41,25 @@ async fn main() -> anyhow::Result<()> {
     let mut saw_done = false;
     while let Some(message) = socket.next().await {
         match message? {
-            Message::Text(text) => {
-                println!("{text}");
-                if text.contains(r#""event":"done""#) {
-                    saw_done = true;
-                    break;
+            Message::Binary(frame) => {
+                let envelope: EventEnvelope =
+                    bincode::deserialize(&frame).context("failed to decode pipeline event")?;
+                match &envelope.event {
+                    PipelineEvent::AudioFrame { pcm, spec, .. } => {
+                        println!(
+                            "audio_frame pcm_bytes={} rate={}",
+                            pcm.len(),
+                            spec.sample_rate
+                        );
+                    }
+                    PipelineEvent::Done { latency_ms, .. } => {
+                        println!("done latency_ms={latency_ms}");
+                        saw_done = true;
+                        break;
+                    }
+                    PipelineEvent::Error { message } => bail!("{message}"),
+                    other => println!("{other:?}"),
                 }
-                if text.contains(r#""event":"error""#) {
-                    bail!("{text}");
-                }
-            }
-            Message::Binary(audio) => {
-                println!("binary_audio_bytes={}", audio.len());
             }
             Message::Close(_) => break,
             _ => {}
