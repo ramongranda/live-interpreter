@@ -5,10 +5,12 @@ set -euo pipefail
 # (LI_TRANSLATE_BACKEND=candle). Default: Qwen2.5-1.5B-Instruct q4_k_m.
 # Override the model with env vars before running.
 
+# Default 3B (quality sweet spot; coexists with Qwen-TTS+Whisper on 16GB once
+# Candle replaces Ollama). Set the env vars below for 1.5B/0.5B on tighter VRAM.
 OUT_DIR="${LI_TRANSLATE_DIR:-data/models/translate}"
-GGUF_REPO="${LI_TRANSLATE_GGUF_REPO:-Qwen/Qwen2.5-1.5B-Instruct-GGUF}"
-GGUF_FILE="${LI_TRANSLATE_GGUF_FILE:-qwen2.5-1.5b-instruct-q4_k_m.gguf}"
-TOKENIZER_REPO="${LI_TRANSLATE_TOKENIZER_REPO:-Qwen/Qwen2.5-1.5B-Instruct}"
+GGUF_REPO="${LI_TRANSLATE_GGUF_REPO:-Qwen/Qwen2.5-3B-Instruct-GGUF}"
+GGUF_FILE="${LI_TRANSLATE_GGUF_FILE:-qwen2.5-3b-instruct-q4_k_m.gguf}"
+TOKENIZER_REPO="${LI_TRANSLATE_TOKENIZER_REPO:-Qwen/Qwen2.5-3B-Instruct}"
 
 mkdir -p "${OUT_DIR}"
 

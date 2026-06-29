@@ -186,8 +186,11 @@ impl Translator {
 }
 
 /// Default GGUF path for the Candle backend (override with `LI_CANDLE_TRANSLATE_GGUF`).
+/// 3B is the quality/VRAM sweet spot: it beat 1.5B on an idiom A/B and still
+/// coexists with Qwen-TTS (~10GB) + Whisper on a 16GB card once Candle replaces
+/// Ollama. Use the 1.5B/0.5B GGUFs via the env override for tighter VRAM.
 pub(crate) const DEFAULT_CANDLE_GGUF: &str =
-    "data/models/translate/qwen2.5-1.5b-instruct-q4_k_m.gguf";
+    "data/models/translate/qwen2.5-3b-instruct-q4_k_m.gguf";
 
 /// Pure backend choice: an explicit `LI_TRANSLATE_BACKEND` wins; otherwise
 /// prefer Candle only when both the feature is compiled in and the model is

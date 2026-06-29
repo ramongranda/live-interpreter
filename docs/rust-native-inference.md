@@ -116,16 +116,28 @@ built with `candle-translate` **and** the GGUF model is present (`resolve_backen
 `LI_TRANSLATE_BACKEND` still overrides. So a GPU build with the model downloaded uses Candle with no
 config; everything else falls back to Ollama. No footgun on non-candle builds.
 
-**Model size A/B (es→en, GPU, q4_k_m).** Qwen2.5 **0.5B** vs **1.5B**:
+**Model size A/B (es→en, q4_k_m).** Qwen2.5 **0.5B / 1.5B / 3B** on a hard idiom set. Quality is
+device-independent (greedy → CPU output == GPU output), so the 3B/1.5B comparison was run on CPU;
+GPU latency for 0.5B/1.5B was measured directly:
 
-| | 0.5B | 1.5B |
-|---|---|---|
-| latency | ~0.13s | ~0.10s |
-| VRAM | ~0.5GB | ~1.1GB |
-| quality | good on plain sentences; idiom *"me la jugué"* → "I played with" (wrong) | slightly better nuance; idiom → "I lost it" (closer) |
+| metric | 0.5B | 1.5B | 3B |
+| --- | --- | --- | --- |
+| GPU latency | ~0.13s | ~0.10s | ~0.2–0.4s (est.) |
+| GPU VRAM | ~0.5GB | ~1.1GB | ~2.8GB |
+| *"me la jugué"* (took a risk) | "I played with" ❌ | "I got off easy"/"I lost it" ❌ | **"I took a risk"** ✓ |
+| *"no la caguemos"* | — | "don't let us forget" ❌ | "don't let us down" ✓ |
+| *"se me hace bola"* | — | "feels like a ball" ❌ | "doesn't make sense to me" ✓ |
 
-Latency is effectively tied (both <150ms, both beat Ollama). **Default stays 1.5B** for the quality
-edge; 0.5B is the low-VRAM option via `LI_CANDLE_TRANSLATE_GGUF`.
+3B clearly wins on idioms/register; 1.5B makes literal errors 3B avoids. Latency is irrelevant at
+all sizes (≪ TTS 2.5s). **Default promoted to 3B** — it coexists with Qwen-TTS (~10GB) + Whisper on a
+16GB card once Candle replaces Ollama (≈13GB total; the earlier OOM was Ollama still resident). 1.5B
+/0.5B remain the tighter-VRAM options via `LI_CANDLE_TRANSLATE_GGUF`. 7B q4 (~4.7GB) would not
+coexist with Qwen-TTS on 16GB, so it was not pursued.
+
+> Note: GPU vs CPU does **not** change translation quality (same model, greedy → identical tokens —
+> verified: 1.5B gave identical text on CPU and GPU). GPU only buys speed, which is what lets you run
+> a bigger, higher-quality model (3B) without paying a latency penalty. On CPU you are forced to a
+> tiny model to stay fast, so CPU is worse on both quality and latency.
 
 **Dedicated NMT (Marian/Opus-MT): not pursued — YAGNI, evidence-backed.** A dedicated es↔en NMT would
 save ~0.8GB more VRAM, but: (1) translate is already ~0.1s — negligible next to TTS ~2.5s, the real
