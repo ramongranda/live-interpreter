@@ -32,6 +32,9 @@ pub struct GpuProcessMem {
 /// A point-in-time view of device VRAM. `source` records which probe produced it.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct VramSnapshot {
+    /// NVML index of the device this snapshot describes — the card the gate
+    /// approves and the server is pinned to (`CUDA_VISIBLE_DEVICES`).
+    pub device_index: u32,
     pub device_name: String,
     pub total_mb: u64,
     pub free_mb: u64,
@@ -51,9 +54,10 @@ pub fn nvml_snapshot() -> Result<VramSnapshot> {
     if count == 0 {
         bail!("NVML reports zero NVIDIA devices");
     }
+    let index = select_device_index(&nvml, count);
     let device = nvml
-        .device_by_index(0)
-        .map_err(|e| anyhow!("NVML device_by_index(0) failed: {e}"))?;
+        .device_by_index(index)
+        .map_err(|e| anyhow!("NVML device_by_index({index}) failed: {e}"))?;
     let mem = device
         .memory_info()
         .map_err(|e| anyhow!("NVML memory_info failed: {e}"))?;
@@ -86,6 +90,7 @@ pub fn nvml_snapshot() -> Result<VramSnapshot> {
         .unwrap_or(0);
 
     Ok(VramSnapshot {
+        device_index: index,
         device_name,
         total_mb: mem.total / (1024 * 1024),
         free_mb: mem.free / (1024 * 1024),
@@ -94,6 +99,42 @@ pub fn nvml_snapshot() -> Result<VramSnapshot> {
         source: "nvml",
         processes,
     })
+}
+
+/// Pick which GPU the server should use. `LI_GPU_INDEX` forces a specific card
+/// (when in range); otherwise the device with the most *free* VRAM wins — so a
+/// second card with headroom is chosen over a saturated primary. Multi-GPU
+/// aware; collapses to index 0 on a single-card box.
+fn select_device_index(nvml: &Nvml, count: u32) -> u32 {
+    let free_by_index: Vec<u64> = (0..count)
+        .map(|i| {
+            nvml.device_by_index(i)
+                .ok()
+                .and_then(|d| d.memory_info().ok())
+                .map(|m| m.free)
+                .unwrap_or(0)
+        })
+        .collect();
+    let forced = std::env::var("LI_GPU_INDEX")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok());
+    choose_index(forced, &free_by_index)
+}
+
+/// Pure selection rule (testable without NVML): honor a forced index when it is
+/// in range, else pick the device with the most free VRAM.
+fn choose_index(forced: Option<u32>, free_by_index: &[u64]) -> u32 {
+    if let Some(idx) = forced
+        && (idx as usize) < free_by_index.len()
+    {
+        return idx;
+    }
+    free_by_index
+        .iter()
+        .enumerate()
+        .max_by_key(|&(_, &free)| free)
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
 }
 
 /// Fallback probe when NVML is unavailable (driver/library missing).
@@ -149,6 +190,8 @@ async fn nvidia_smi_snapshot() -> Result<VramSnapshot> {
     processes.sort_by_key(|p| std::cmp::Reverse(p.used_mb));
 
     Ok(VramSnapshot {
+        // Fallback reads only the first GPU line; multi-GPU selection needs NVML.
+        device_index: 0,
         device_name,
         total_mb,
         free_mb,
@@ -184,8 +227,12 @@ pub fn evaluate_preflight(snapshot: &VramSnapshot, min_vram_mb: u64) -> GpuPrefl
         GpuPreflight {
             ready: true,
             message: format!(
-                "GPU lista: {} MiB libres de {} MiB en {} (minimo {} MiB)",
-                snapshot.free_mb, snapshot.total_mb, snapshot.device_name, min_vram_mb
+                "GPU lista: {} MiB libres de {} MiB en {} (GPU #{}, minimo {} MiB)",
+                snapshot.free_mb,
+                snapshot.total_mb,
+                snapshot.device_name,
+                snapshot.device_index,
+                min_vram_mb
             ),
         }
     } else {
@@ -209,15 +256,15 @@ fn retention_message(snapshot: &VramSnapshot, min_vram_mb: u64) -> String {
     let deficit = min_vram_mb.saturating_sub(snapshot.free_mb);
     if listed.is_empty() {
         format!(
-            "Servidor GPU bloqueado: {} MiB libres < {} MiB requeridos (faltan {} MiB). \
+            "Servidor GPU bloqueado (GPU #{}): {} MiB libres < {} MiB requeridos (faltan {} MiB). \
              No se detectan procesos reteniendo VRAM.",
-            snapshot.free_mb, min_vram_mb, deficit
+            snapshot.device_index, snapshot.free_mb, min_vram_mb, deficit
         )
     } else {
         format!(
-            "Servidor GPU bloqueado: {} MiB libres < {} MiB requeridos (faltan {} MiB). \
+            "Servidor GPU bloqueado (GPU #{}): {} MiB libres < {} MiB requeridos (faltan {} MiB). \
              Reteniendo VRAM: {}.",
-            snapshot.free_mb, min_vram_mb, deficit, listed
+            snapshot.device_index, snapshot.free_mb, min_vram_mb, deficit, listed
         )
     }
 }
@@ -553,8 +600,29 @@ pub fn select_launch_env(
 mod tests {
     use super::*;
 
+    #[test]
+    fn choose_index_prefers_most_free_when_unforced() {
+        assert_eq!(choose_index(None, &[3000, 12000, 1000]), 1);
+    }
+
+    #[test]
+    fn choose_index_honors_forced_when_in_range() {
+        assert_eq!(choose_index(Some(2), &[12000, 9000, 500]), 2);
+    }
+
+    #[test]
+    fn choose_index_falls_back_to_max_free_when_forced_out_of_range() {
+        assert_eq!(choose_index(Some(5), &[1000, 8000]), 1);
+    }
+
+    #[test]
+    fn choose_index_zero_on_no_devices() {
+        assert_eq!(choose_index(None, &[]), 0);
+    }
+
     fn snap(total_mb: u64, free_mb: u64) -> VramSnapshot {
         VramSnapshot {
+            device_index: 0,
             device_name: "GPU".into(),
             total_mb,
             free_mb,
@@ -676,6 +744,7 @@ mod tests {
     #[test]
     fn preflight_blocks_with_named_holder_when_free_below_min() {
         let snapshot = VramSnapshot {
+            device_index: 0,
             device_name: "RTX 5060 Ti".into(),
             total_mb: 16000,
             free_mb: 3000,
@@ -704,6 +773,7 @@ mod tests {
     #[test]
     fn preflight_passes_when_free_meets_min() {
         let snapshot = VramSnapshot {
+            device_index: 0,
             device_name: "RTX 5060 Ti".into(),
             total_mb: 16000,
             free_mb: 12000,
@@ -729,6 +799,7 @@ mod tests {
         let config = DesktopConfig::from_root(root.clone());
 
         let snapshot = VramSnapshot {
+            device_index: 0,
             device_name: "GPU".into(),
             total_mb: 16000,
             free_mb: 4000,

@@ -67,7 +67,7 @@ Whisper ggml model is **not** in the repo: `scripts/download-whisper-model.sh la
 
 **Things that bite:**
 
-- **GPU gate.** Server mode is refused when total VRAM `< LI_MIN_SERVER_VRAM_MB` (default 8000). VRAM telemetry is NVML (`src/vram.rs`, `nvml-wrapper`), not `nvidia-smi`; the threshold check is `GpuPreflight` in `desktop.rs`.
+- **GPU gate.** Server mode is refused when free VRAM `< LI_MIN_SERVER_VRAM_MB` (default 8000). VRAM telemetry is NVML (`src/vram.rs`, `nvml-wrapper`), not `nvidia-smi`; the threshold check is `GpuPreflight` in `desktop.rs`. **Multi-GPU:** `nvml_snapshot` selects the device with the most *free* VRAM (or `LI_GPU_INDEX` to force one), so a second card with headroom passes the gate even when the primary is full. The runtime then pins the server to that card via `CUDA_VISIBLE_DEVICES` (+ `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so the CUDA index matches NVML's). `VramSnapshot.device_index` carries the choice.
 - **Voice profile injection.** Saving a voice writes `data/voice/reference.{wav,txt}`; on next server start these are passed as `LI_VOICE_REF`/`LI_VOICE_REF_TEXT`, and `tts.rs` base64-encodes the WAV into each TTS request. Requires a server restart to take effect.
 - **Process lifecycle** is PID files under `data/logs/*.pid` plus `pgrep` patterns; "healthy" = HTTP `/health` poll. Independent signals.
 - **Spanish user-facing strings live in the domain/UI layer** (voice-profile messages, control-panel labels). Intentional — keep new user-facing status text in Spanish to match.
@@ -76,7 +76,7 @@ Whisper ggml model is **not** in the repo: `scripts/download-whisper-model.sh la
 
 ## Configuration
 
-Server reads `LI_*` env in `src/config.rs::from_env`; the runtime/client read additional `LI_*`. Key ones: `LI_BIND` (server addr), `LI_WHISPER_MODEL`, `LI_OLLAMA_URL`/`LI_OLLAMA_MODEL` (default `translator:latest`), `LI_QWEN_TTS_URL`/`_MODEL`/`_VOICE`, `LI_MIN_SERVER_VRAM_MB`, `LI_CONTROL_BIND` (control panel, default `127.0.0.1:8799`), `LI_ROLE` (mesh: `provider`/`consumer`/`bench`), `LI_MESH_TOKEN`, `LI_AUTH_TOKEN` (optional bearer/`?token=` for LAN). Client VAD tuning (`LI_CLIENT_VAD_THRESHOLD`, `LI_CLIENT_SILENCE_MS`, …) is in `docs/meeting-client.md`. Full list in README "Configuration" and `src/config.rs`.
+Server reads `LI_*` env in `src/config.rs::from_env`; the runtime/client read additional `LI_*`. Key ones: `LI_BIND` (server addr), `LI_WHISPER_MODEL`, `LI_OLLAMA_URL`/`LI_OLLAMA_MODEL` (default `translator:latest`), `LI_QWEN_TTS_URL`/`_MODEL`/`_VOICE`, `LI_MIN_SERVER_VRAM_MB`, `LI_GPU_INDEX` (force a GPU; default = most-free), `LI_CONTROL_BIND` (control panel, default `127.0.0.1:8799`), `LI_ROLE` (mesh: `provider`/`consumer`/`bench`), `LI_MESH_TOKEN`, `LI_AUTH_TOKEN` (optional bearer/`?token=` for LAN). Client VAD tuning (`LI_CLIENT_VAD_THRESHOLD`, `LI_CLIENT_SILENCE_MS`, …) is in `docs/meeting-client.md`. Full list in README "Configuration" and `src/config.rs`.
 
 ## Docs
 

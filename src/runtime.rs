@@ -117,18 +117,32 @@ impl LiveRuntime {
 
     /// Real-time VRAM gate + spawn of qwen3-tts, the GPU server, and the mic.
     pub async fn start_server(&self) -> ActionResult {
-        let gpu = crate::vram::gpu_preflight_realtime(self.config.min_server_vram_mb).await;
-        if !gpu.ready {
+        // One snapshot drives both the gate and the device pin: the chosen GPU
+        // (most free VRAM, or LI_GPU_INDEX) is the one the server runs on.
+        let snapshot = crate::vram::vram_snapshot().await;
+        let (ready, message, gpu_index) = match &snapshot {
+            Ok(snap) => {
+                let preflight =
+                    crate::vram::evaluate_preflight(snap, self.config.min_server_vram_mb);
+                (preflight.ready, preflight.message, snap.device_index)
+            }
+            Err(error) => (
+                false,
+                format!("Servidor GPU bloqueado: no se pudo leer la VRAM ({error:#})"),
+                0,
+            ),
+        };
+        if !ready {
             return ActionResult {
                 ok: false,
-                output: gpu.message,
+                output: message,
             };
         }
 
         let mut log = String::new();
         for build in [
             self.qwen_command(),
-            self.server_command(),
+            self.server_command(gpu_index),
             self.mic_command(),
         ] {
             let (service, command) = build;
@@ -214,11 +228,15 @@ impl LiveRuntime {
         (ManagedService::QwenTts, cmd)
     }
 
-    fn server_command(&self) -> (ManagedService, Command) {
+    fn server_command(&self, gpu_index: u32) -> (ManagedService, Command) {
         let mut cmd = Command::new(self.config.root.join("target/release/live-interpreter"));
         cmd.current_dir(&self.config.root)
             .env("LI_ROLE", "server")
-            .env("LI_BIND", &self.config.stack_bind);
+            .env("LI_BIND", &self.config.stack_bind)
+            // Pin Whisper/CUDA to the gate-selected GPU. PCI_BUS_ID ordering makes
+            // the CUDA device index line up with the NVML index the preflight used.
+            .env("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+            .env("CUDA_VISIBLE_DEVICES", gpu_index.to_string());
         for (key, value) in self.voice_ref_envs() {
             cmd.env(key, value);
         }
